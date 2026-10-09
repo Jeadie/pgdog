@@ -9,6 +9,63 @@ use crate::{
 
 use super::*;
 
+fn read_strategy_servers(active: &[bool]) -> Vec<LinkedServer> {
+    use crate::backend::{Pool, Server, pool::Guard};
+    use tokio::time::Instant;
+
+    active
+        .iter()
+        .enumerate()
+        .map(|(index, &active)| {
+            let mut server = Server::default();
+            if active {
+                server.prepared_statements_mut().state_mut().add('C');
+            }
+            // These protocol-only fixtures have no network connection to reuse.
+            server.force_close();
+            LinkedServer {
+                server: Guard::new(Pool::new_test(), Box::new(server), Instant::now()),
+                shard: index + 10,
+                linked: false,
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn specific_read_strategy_reads_once_per_pass_and_resets() {
+    let mut servers = read_strategy_servers(&[true, true, true]);
+    let mut state = MultiShard::new(servers.len(), &Route::default());
+    state.read_from(11);
+    assert_eq!(state.read_strategy_mut().next_server(&servers), Some(1));
+    // Yield control so the result-processing state can emit or choose again.
+    assert_eq!(state.read_strategy_mut().next_server(&servers), None);
+    state.read_strategy_mut().reset();
+    // Selection follows the shard even if its position changes.
+    servers.swap(0, 1);
+    assert_eq!(state.read_strategy_mut().next_server(&servers), Some(0));
+
+    // A query reset restores the default read policy.
+    state.query_complete();
+    assert_eq!(state.read_strategy_mut().next_server(&servers), Some(0));
+    assert_eq!(state.read_strategy_mut().next_server(&servers), Some(1));
+    assert_eq!(state.read_strategy_mut().next_server(&servers), Some(2));
+    assert_eq!(state.read_strategy_mut().next_server(&servers), None);
+}
+
+#[tokio::test]
+async fn specific_read_strategy_does_not_fall_back_to_other_servers() {
+    let servers = read_strategy_servers(&[true, false, true]);
+    let mut state = MultiShard::new(servers.len(), &Route::default());
+    // Shard 11 is idle; shard 1 is absent even though vector index 1 exists.
+    for shard_id in [11, 1] {
+        state.read_from(shard_id);
+        assert_eq!(state.read_strategy_mut().next_server(&servers), None);
+    }
+    state.read_from(12);
+    assert_eq!(state.read_strategy_mut().next_server(&servers), Some(2));
+}
+
 #[test]
 fn test_inconsistent_row_descriptions() {
     let route = Route::default();

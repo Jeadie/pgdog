@@ -33,6 +33,8 @@ pub(super) enum ReadStrategy {
     /// Read one message per active server in each ordered pass.
     /// Each call starts at the first server, including after an early return.
     RoundRobin { next: usize },
+    /// Read one message from the requested shard's server per pass.
+    Specific { shard_id: usize, consumed: bool },
 }
 
 impl Default for ReadStrategy {
@@ -46,6 +48,7 @@ impl ReadStrategy {
     fn reset(&mut self) {
         match self {
             Self::RoundRobin { next } => *next = 0,
+            Self::Specific { consumed, .. } => *consumed = false,
         }
     }
 
@@ -60,6 +63,14 @@ impl ReadStrategy {
                     .find_map(|(index, server)| server.has_more_messages().then_some(index));
                 *next = index.map_or(servers.len(), |index| index + 1);
                 index
+            }
+            Self::Specific { shard_id, consumed } => {
+                if std::mem::replace(consumed, true) {
+                    return None;
+                }
+                servers
+                    .iter()
+                    .position(|server| server.shard == *shard_id && server.has_more_messages())
             }
         }
     }
@@ -158,6 +169,14 @@ impl MultiShard {
 
     pub(super) fn read_strategy_mut(&mut self) -> &mut ReadStrategy {
         &mut self.read_strategy
+    }
+
+    /// Request one message per pass from a particular shard's server.
+    pub(super) fn read_from(&mut self, shard_id: usize) {
+        self.read_strategy = ReadStrategy::Specific {
+            shard_id,
+            consumed: false,
+        };
     }
 
     /// Check if the message we received from Postgres should be sent to the client, skipped,
