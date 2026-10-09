@@ -1,3 +1,4 @@
+use crate::frontend::router::parser::order_by::OrderByColumn;
 use crate::{
     frontend::router::parser::{
         DistinctBy, OrderBy, Shard, ShardWithPriority,
@@ -74,7 +75,9 @@ fn test_order_by_helper_after_star_expansion_is_dropped_after_sorting() {
     });
     let mut route = Route::select(
         ShardWithPriority::new_default_unset(Shard::All),
-        vec![OrderBy::AscColumn("__pgdog_order_col0".into())],
+        vec![OrderBy::Column(OrderByColumn::Asc(
+            "__pgdog_order_col0".into(),
+        ))],
         Default::default(),
         Default::default(),
         None,

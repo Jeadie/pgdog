@@ -1,5 +1,6 @@
 use crate::backend::schema::Schema;
 use crate::frontend::router::Ast;
+use crate::frontend::router::parser::order_by::OrderByColumn;
 use crate::frontend::router::parser::rewrite::statement::plan::RewriteResult;
 use crate::frontend::router::parser::rewrite::statement::projection;
 use crate::frontend::router::parser::route::{Route, Shard, ShardWithPriority};
@@ -229,7 +230,7 @@ async fn cross_shard_order_by_projects_missing_sort_column() {
         .unwrap();
     client_request.route = Some(Route::select(
         ShardWithPriority::new_table(Shard::All),
-        vec![OrderBy::AscColumn("price".into())],
+        vec![OrderBy::Column(OrderByColumn::Asc("price".into()))],
         Default::default(),
         Limit::default(),
         None,
@@ -249,7 +250,9 @@ async fn cross_shard_order_by_projects_missing_sort_column() {
     assert!(query.query().contains("price AS __pgdog_order_col0"));
     assert_eq!(
         client_request.route().order_by(),
-        &[OrderBy::AscColumn("__pgdog_order_col0".into())]
+        &[OrderBy::Column(OrderByColumn::Asc(
+            "__pgdog_order_col0".into()
+        ))]
     );
     assert_eq!(
         client_request
@@ -269,7 +272,7 @@ fn cached_projection_does_not_depend_on_first_route_order() {
     first.ast = Some(ast.clone());
     first.route = Some(Route::select(
         ShardWithPriority::new_table(Shard::All),
-        vec![OrderBy::AscColumn("price".into())],
+        vec![OrderBy::Column(OrderByColumn::Asc("price".into()))],
         Default::default(),
         Limit::default(),
         None,
@@ -284,7 +287,9 @@ fn cached_projection_does_not_depend_on_first_route_order() {
     assert!(first_query.query().contains("__pgdog_order_col1"));
     assert_eq!(
         first.route().order_by(),
-        &[OrderBy::AscColumn("__pgdog_order_col1".into())]
+        &[OrderBy::Column(OrderByColumn::Asc(
+            "__pgdog_order_col1".into()
+        ))]
     );
 
     let mut second = ClientRequest::from(vec![ProtocolMessage::Query(Query::new(sql))]);
@@ -292,8 +297,11 @@ fn cached_projection_does_not_depend_on_first_route_order() {
     second.route = Some(Route::select(
         ShardWithPriority::new_table(Shard::All),
         vec![
-            OrderBy::AscVectorL2Column("embedding".into(), Vector::from(&[1.0, 2.0, 3.0][..])),
-            OrderBy::AscColumn("price".into()),
+            OrderBy::Column(OrderByColumn::AscVectorL2(
+                "embedding".into(),
+                Vector::from(&[1.0, 2.0, 3.0][..]),
+            )),
+            OrderBy::Column(OrderByColumn::Asc("price".into())),
         ],
         Default::default(),
         Limit::default(),
@@ -304,8 +312,8 @@ fn cached_projection_does_not_depend_on_first_route_order() {
     assert_eq!(
         second.route().order_by(),
         &[
-            OrderBy::AscColumn("__pgdog_order_col0".into()),
-            OrderBy::AscColumn("__pgdog_order_col1".into())
+            OrderBy::Column(OrderByColumn::Asc("__pgdog_order_col0".into())),
+            OrderBy::Column(OrderByColumn::Asc("__pgdog_order_col1".into()))
         ]
     );
 }
@@ -317,7 +325,7 @@ fn aliased_projected_sort_column_remaps_route() {
     request.ast = Some(Arc::new(Ast::parse(sql).unwrap()));
     request.route = Some(Route::select(
         ShardWithPriority::new_table(Shard::All),
-        vec![OrderBy::AscColumn("price".into())],
+        vec![OrderBy::Column(OrderByColumn::Asc("price".into()))],
         Default::default(),
         Limit::default(),
         None,
@@ -332,7 +340,7 @@ fn aliased_projected_sort_column_remaps_route() {
     assert!(!query.query().contains("__pgdog_order_col"));
     assert_eq!(
         request.route().order_by(),
-        &[OrderBy::AscColumn("item_price".into())]
+        &[OrderBy::Column(OrderByColumn::Asc("item_price".into()))]
     );
     assert!(!request.route().projection_rewrite_plan.order_by_helpers[0].injected);
 }
@@ -344,7 +352,7 @@ fn duplicate_sort_column_names_use_injected_helper() {
     request.ast = Some(Arc::new(Ast::parse(sql).unwrap()));
     request.route = Some(Route::select(
         ShardWithPriority::new_table(Shard::All),
-        vec![OrderBy::AscColumn("price".into())],
+        vec![OrderBy::Column(OrderByColumn::Asc("price".into()))],
         Default::default(),
         Limit::default(),
         None,
@@ -359,7 +367,9 @@ fn duplicate_sort_column_names_use_injected_helper() {
     assert!(query.query().contains("b.price AS __pgdog_order_col0"));
     assert_eq!(
         request.route().order_by(),
-        &[OrderBy::AscColumn("__pgdog_order_col0".into())]
+        &[OrderBy::Column(OrderByColumn::Asc(
+            "__pgdog_order_col0".into()
+        ))]
     );
 }
 
@@ -371,8 +381,8 @@ fn helper_replaces_the_matching_duplicate_order_by_position() {
     request.route = Some(Route::select(
         ShardWithPriority::new_table(Shard::All),
         vec![
-            OrderBy::AscColumn("price".into()),
-            OrderBy::AscColumn("price".into()),
+            OrderBy::Column(OrderByColumn::Asc("price".into())),
+            OrderBy::Column(OrderByColumn::Asc("price".into())),
         ],
         Default::default(),
         Limit::default(),
@@ -384,8 +394,8 @@ fn helper_replaces_the_matching_duplicate_order_by_position() {
     assert_eq!(
         request.route().order_by(),
         &[
-            OrderBy::AscColumn("price".into()),
-            OrderBy::AscColumn("__pgdog_order_col1".into())
+            OrderBy::Column(OrderByColumn::Asc("price".into())),
+            OrderBy::Column(OrderByColumn::Asc("__pgdog_order_col1".into()))
         ]
     );
 }
@@ -405,7 +415,7 @@ async fn aggregate_order_by_and_offset_compose_after_route() {
         .unwrap();
     client_request.route = Some(Route::select(
         ShardWithPriority::new_table(Shard::All),
-        vec![OrderBy::AscColumn("created_at".into())],
+        vec![OrderBy::Column(OrderByColumn::Asc("created_at".into()))],
         Default::default(),
         Limit::default(),
         None,
@@ -435,7 +445,9 @@ async fn aggregate_order_by_and_offset_compose_after_route() {
     let route = client_request.route();
     assert_eq!(
         route.order_by(),
-        &[OrderBy::AscColumn("__pgdog_order_col0".into())]
+        &[OrderBy::Column(OrderByColumn::Asc(
+            "__pgdog_order_col0".into()
+        ))]
     );
     assert_eq!(
         route.projection_rewrite_plan.aggregate_helpers[0].alias,

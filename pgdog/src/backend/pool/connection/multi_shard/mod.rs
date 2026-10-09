@@ -163,6 +163,10 @@ impl MultiShard {
         })
     }
 
+    // pub(super) fn order_servers(&self, shard_ids: &[&usize]) -> usize {
+    //     self.buffer.
+    // }
+
     /// Get the next available server message to send to the client.
     ///
     /// Used when buffering and transforming messages. This returns [`None`] until
