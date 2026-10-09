@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-use super::buffer::Buffer;
+use super::{LinkedServer, buffer::Buffer};
 
 mod binding;
 mod error;
@@ -26,6 +26,44 @@ pub(crate) use binding::MultiBinding;
 pub(crate) use error::Error;
 pub(crate) use upgrade::MultiShardUpgrade;
 use validator::Validator;
+
+/// Determine which [`LinkedServer`] to pull server messages from next.
+#[derive(Debug)]
+pub(super) enum ReadStrategy {
+    /// Read one message per active server in each ordered pass.
+    /// Each call starts at the first server, including after an early return.
+    RoundRobin { next: usize },
+}
+
+impl Default for ReadStrategy {
+    fn default() -> Self {
+        Self::RoundRobin { next: 0 }
+    }
+}
+
+impl ReadStrategy {
+    /// Start a fresh pass through the servers.
+    fn reset(&mut self) {
+        match self {
+            Self::RoundRobin { next } => *next = 0,
+        }
+    }
+
+    /// Select the next active server and advance the strategy's cursor.
+    fn next_server(&mut self, servers: &[LinkedServer]) -> Option<usize> {
+        match self {
+            Self::RoundRobin { next } => {
+                let index = servers
+                    .iter()
+                    .enumerate()
+                    .skip(*next)
+                    .find_map(|(index, server)| server.has_more_messages().then_some(index));
+                *next = index.map_or(servers.len(), |index| index + 1);
+                index
+            }
+        }
+    }
+}
 
 #[derive(Default, Debug)]
 struct RequestState {
@@ -59,6 +97,8 @@ pub(crate) struct MultiShard {
     request_state: RequestState,
     /// Sorting/aggregate buffer.
     buffer: Buffer,
+    /// Server read policy for the current query.
+    read_strategy: ReadStrategy,
     /// Row decoder.
     decoder: Decoder,
     /// Row consistency validator.
@@ -106,6 +146,7 @@ impl MultiShard {
     fn reset(&mut self) {
         self.request_state = RequestState::default();
         self.buffer = Buffer::default();
+        self.read_strategy = ReadStrategy::default();
         self.validator.reset();
 
         // Intentionally does not reset:
@@ -113,6 +154,10 @@ impl MultiShard {
         //  2. Number of shards
         //  3. Decoder state
         //  4. Pending Binds, pushed before this run
+    }
+
+    pub(super) fn read_strategy_mut(&mut self) -> &mut ReadStrategy {
+        &mut self.read_strategy
     }
 
     /// Check if the message we received from Postgres should be sent to the client, skipped,

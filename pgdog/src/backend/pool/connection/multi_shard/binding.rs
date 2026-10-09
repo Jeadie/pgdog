@@ -172,12 +172,9 @@ impl MultiBinding {
             }
 
             let mut read = false;
-            for server in &mut self.servers {
-                if !server.has_more_messages() {
-                    continue;
-                }
-
-                let message = server.read().await?;
+            self.state.read_strategy_mut().reset();
+            while let Some(index) = self.state.read_strategy_mut().next_server(&self.servers) {
+                let message = self.servers[index].read().await?;
                 read = true;
 
                 if let Some(message) = self.state.handle_server_message(message)? {
