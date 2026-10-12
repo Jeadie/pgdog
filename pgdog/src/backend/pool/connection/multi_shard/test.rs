@@ -1,6 +1,6 @@
 use crate::{
     frontend::router::parser::{
-        DistinctBy, OrderBy, Shard, ShardWithPriority,
+        Aggregate, DistinctBy, OrderBy, Shard, ShardWithPriority,
         rewrite::statement::projection::{OrderByHelper, OrderBySource, ProjectionRewritePlan},
     },
     net::{BindComplete, DataRow, Field, Format},
@@ -487,4 +487,167 @@ fn test_ready_for_query_drops_pending_binds() {
             .unwrap();
     }
     assert!(multi_shard.bound_statements.is_empty());
+}
+
+/// Extended protocol exchange asking for binary results, followed by a simple
+/// Query on the same binding (e.g. psycopg's binary cursor, then a ClientCursor
+/// in the same transaction). Returns the data rows the client receives for the
+/// Query, decoded as text.
+async fn simple_query_after_binary_bind(
+    route: Route,
+    rd: RowDescription,
+    shard_rows: [Vec<DataRow>; 2],
+) -> Vec<DataRow> {
+    use crate::{
+        frontend::ClientRequest,
+        net::{Execute, ProtocolMessage, Query, Sync},
+    };
+
+    // No network connections: server messages are fed to the state directly.
+    let mut binding = MultiBinding {
+        servers: vec![],
+        state: MultiShard::new(2, &route).boxed(),
+        transaction_stmt: None,
+        is_read: true,
+    };
+
+    let bind = Bind::new_params_codes_results("", &[], &[], &[1]);
+    let mut request = ClientRequest::from(vec![
+        ProtocolMessage::Bind(bind.clone()),
+        ProtocolMessage::Execute(Execute::new()),
+        ProtocolMessage::Sync(Sync),
+    ]);
+    request.route = Some(Route::read(ShardWithPriority::new_default_unset(
+        Shard::Multi(vec![0, 1]),
+    )));
+    binding.bind(&bind);
+    binding.send(&request).await.unwrap();
+    // Without servers, send() counts zero shards. Two would have received it.
+    binding.state.update_shards(2);
+    for message in [
+        BindComplete.message(),
+        CommandComplete::from_str("SELECT 0").message(),
+        ReadyForQuery::idle().message(),
+    ] {
+        for _ in 0..2 {
+            binding
+                .state
+                .handle_server_message(message.clone())
+                .unwrap();
+        }
+    }
+
+    let mut request = ClientRequest::from(vec![ProtocolMessage::Query(Query::new("SELECT"))]);
+    request.route = Some(route);
+    binding.send(&request).await.unwrap();
+    binding.state.update_shards(2);
+
+    let mut server_messages = vec![rd.message(), rd.message()];
+    for rows in &shard_rows {
+        server_messages.extend(rows.iter().map(|row| row.message()));
+        server_messages
+            .push(CommandComplete::from_str(&format!("SELECT {}", rows.len())).message());
+    }
+
+    let mut client_messages = vec![];
+    for message in server_messages {
+        client_messages.extend(binding.state.handle_server_message(message).unwrap());
+        while let Some(message) = binding.state.get_server_message() {
+            client_messages.push(message);
+        }
+    }
+
+    client_messages
+        .into_iter()
+        .filter(|message| message.code() == 'D')
+        .map(|message| DataRow::from_bytes(message.to_bytes()).unwrap())
+        .collect()
+}
+
+fn id_rows(ids: impl Iterator<Item = i64>) -> Vec<DataRow> {
+    ids.map(|id| {
+        let mut row = DataRow::new();
+        row.add(id);
+        row
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn test_simple_query_after_binary_bind_sorts_rows() {
+    let route = Route::select(
+        ShardWithPriority::new_default_unset(Shard::Multi(vec![0, 1])),
+        vec![OrderBy::Asc(1)],
+        Default::default(),
+        Default::default(),
+        None,
+    );
+    let rows = simple_query_after_binary_bind(
+        route,
+        RowDescription::new(&[Field::bigint("id")]),
+        [id_rows((2..=20).step_by(2)), id_rows((1..=19).step_by(2))],
+    )
+    .await;
+
+    let ids = rows
+        .iter()
+        .map(|row| row.get::<i64>(0, Format::Text).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn test_simple_query_after_binary_bind_aggregates_rows() {
+    let route = Route::select(
+        ShardWithPriority::new_default_unset(Shard::Multi(vec![0, 1])),
+        vec![],
+        Aggregate::new_count(0),
+        Default::default(),
+        None,
+    );
+    let rows = simple_query_after_binary_bind(
+        route,
+        RowDescription::new(&[Field::bigint("count")]),
+        [id_rows([10].into_iter()), id_rows([10].into_iter())],
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i64>(0, Format::Text), Some(20));
+}
+
+/// Extended protocol requests that don't Bind themselves keep the result
+/// formats of the last Bind: only a simple Query clears them.
+#[tokio::test]
+async fn test_extended_requests_keep_bind_formats() {
+    use crate::{
+        frontend::ClientRequest,
+        net::{ProtocolMessage, Sync},
+    };
+
+    let previous_bind = Bind::new_params_codes_results("", &[], &[], &[1, 0]);
+    for message in [
+        ProtocolMessage::Sync(Sync),
+        ProtocolMessage::Bind(Bind::new_statement("")),
+    ] {
+        let route = Route::default();
+        let mut state = MultiShard::new(2, &route);
+        state.decoder.set_row_description(RowDescription::new(&[
+            Field::bigint("id"),
+            Field::text("value"),
+        ]));
+        state.decoder.set_formats(&previous_bind);
+        let mut binding = MultiBinding {
+            servers: vec![],
+            state: state.boxed(),
+            transaction_stmt: None,
+            is_read: true,
+        };
+        let mut request = ClientRequest::from(vec![message]);
+        request.route = Some(route);
+        binding.send(&request).await.unwrap();
+
+        assert_eq!(binding.state.decoder.get_format(0), Format::Binary);
+        assert_eq!(binding.state.decoder.get_format(1), Format::Text);
+    }
 }

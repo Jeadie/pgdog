@@ -17,6 +17,11 @@ pub(crate) struct Decoder {
 }
 
 impl Decoder {
+    /// Simple Query results use the formats in their RowDescription, not a previous Bind.
+    pub(crate) fn reset_formats(&mut self) {
+        self.formats.clear();
+    }
+
     /// Set the format the client specified for the request.
     pub(crate) fn set_formats(&mut self, bind: &Bind) {
         self.formats.clear();
