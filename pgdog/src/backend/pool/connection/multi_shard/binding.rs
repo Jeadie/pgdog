@@ -233,6 +233,13 @@ impl MultiBinding {
             self.state.update_shards(shards_sent);
         } else {
             self.state.update(shards_sent, client_request.route());
+            if client_request
+                .messages
+                .iter()
+                .any(|message| matches!(message, ProtocolMessage::Query(_)))
+            {
+                self.state.decoder.reset_formats();
+            }
         }
 
         Ok(())

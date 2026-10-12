@@ -488,3 +488,55 @@ fn test_ready_for_query_drops_pending_binds() {
     }
     assert!(multi_shard.bound_statements.is_empty());
 }
+
+#[tokio::test]
+async fn test_simple_query_resets_previous_bind_formats() {
+    use crate::{
+        frontend::ClientRequest,
+        net::{ProtocolMessage, Query, Sync},
+    };
+
+    let previous_bind = Bind::new_params_codes_results("", &[], &[], &[1, 0]);
+    for (message, expected_format) in [
+        (
+            ProtocolMessage::Query(Query::new("SELECT 123, 'text'")),
+            Format::Text,
+        ),
+        (ProtocolMessage::Sync(Sync), Format::Binary),
+        (
+            ProtocolMessage::Bind(Bind::new_statement("")),
+            Format::Binary,
+        ),
+    ] {
+        let route = Route::default();
+        let mut state = MultiShard::new(2, &route);
+        state.decoder.set_row_description(RowDescription::new(&[
+            Field::bigint("id"),
+            Field::text("value"),
+        ]));
+        state.decoder.set_formats(&previous_bind);
+        // No network connections are needed to exercise request-state transitions.
+        let mut binding = MultiBinding {
+            servers: vec![],
+            state: state.boxed(),
+            transaction_stmt: None,
+            is_read: true,
+        };
+        let mut request = ClientRequest::from(vec![message]);
+        request.route = Some(route);
+        binding.send(&request).await.unwrap();
+
+        assert_eq!(binding.state.decoder.get_format(0), expected_format);
+        assert_eq!(binding.state.decoder.get_format(1), Format::Text);
+        assert_eq!(binding.state.decoder.row_description().fields.len(), 2);
+        if expected_format == Format::Text {
+            let mut row = DataRow::new();
+            row.add(123_i64).add("text");
+            assert_eq!(
+                row.get::<i64>(0, binding.state.decoder.get_format(0))
+                    .unwrap(),
+                123
+            );
+        }
+    }
+}
