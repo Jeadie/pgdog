@@ -17,6 +17,10 @@ pub(crate) struct Decoder {
 }
 
 impl Decoder {
+    pub(crate) fn has_row_description(&self) -> bool {
+        self.row_description.is_some()
+    }
+
     /// Set the format the client specified for the request.
     pub(crate) fn set_formats(&mut self, bind: &Bind) {
         self.formats.clear();

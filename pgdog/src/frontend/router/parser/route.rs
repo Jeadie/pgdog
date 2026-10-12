@@ -1,3 +1,4 @@
+use crate::frontend::router::parser::order_by::OrderByIdx;
 use std::{fmt::Display, ops::Deref};
 
 use super::{
@@ -722,7 +723,7 @@ mod test {
     fn test_should_buffer_order_by() {
         let route = Route::select(
             ShardWithPriority::new_table(Shard::All),
-            vec![OrderBy::Asc(0)],
+            vec![OrderBy::Index(OrderByIdx::Asc(0))],
             Default::default(),
             Limit::default(),
             None,

@@ -9,6 +9,7 @@ use super::aggregate::{AggregatesRewrite, HelperKind};
 use super::offset::{self, OffsetPlan};
 use super::order_by;
 use crate::backend::schema::Schema;
+use crate::frontend::router::parser::order_by::OrderByColumn;
 use crate::frontend::router::parser::{Aggregate, OrderBy};
 use crate::frontend::{ClientRequest, PreparedStatements};
 use crate::net::{ProtocolMessage, RowDescription};
@@ -43,11 +44,12 @@ pub(crate) enum OrderBySource {
 impl OrderByHelper {
     fn matches(&self, order_by: &OrderBy) -> bool {
         match (&self.source, order_by) {
-            (OrderBySource::Column(source), OrderBy::AscColumn(column))
-            | (OrderBySource::Column(source), OrderBy::DescColumn(column))
-            | (OrderBySource::Vector(source), OrderBy::AscVectorL2Column(column, _)) => {
-                source == column
-            }
+            (OrderBySource::Column(source), OrderBy::Column(OrderByColumn::Asc(column)))
+            | (OrderBySource::Column(source), OrderBy::Column(OrderByColumn::Desc(column)))
+            | (
+                OrderBySource::Vector(source),
+                OrderBy::Column(OrderByColumn::AscVectorL2(column, _)),
+            ) => source == column,
             _ => false,
         }
     }
@@ -161,9 +163,9 @@ pub(crate) fn finalize_after_route(
                 continue;
             };
             *sort = if sort.asc() {
-                OrderBy::AscColumn(helper.alias.clone())
+                OrderBy::Column(OrderByColumn::Asc(helper.alias.clone()))
             } else {
-                OrderBy::DescColumn(helper.alias.clone())
+                OrderBy::Column(OrderByColumn::Desc(helper.alias.clone()))
             };
         }
         route.set_order_by(order_by);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::frontend::router::parser::order_by::OrderByIdx;
 use crate::frontend::router::parser::statement::AdvisoryLockId;
 use pg_raw_parse::walk;
 use pg_raw_parse::{Node, nodes};
@@ -352,9 +353,9 @@ impl QueryParser {
                 match sort_by.node() {
                     Node::A_Const(c) if let Some(ConstValue::Integer(i)) = c.val() => {
                         if asc {
-                            Some(OrderBy::Asc(i as _))
+                            Some(OrderBy::Index(OrderByIdx::Asc(i as _)))
                         } else {
-                            Some(OrderBy::Desc(i as _))
+                            Some(OrderBy::Index(OrderByIdx::Desc(i as _)))
                         }
                     }
 
@@ -362,11 +363,7 @@ impl QueryParser {
                         // TODO: save the entire column and disambiguate
                         // when reading data with RowDescription as context.
                         let col_name = c.fields().into_iter().next_back()?.as_str()?;
-                        if asc {
-                            Some(OrderBy::AscColumn(col_name.into()))
-                        } else {
-                            Some(OrderBy::DescColumn(col_name.into()))
-                        }
+                        Some(OrderBy::column(col_name.into(), asc))
                     }
 
                     Node::A_Expr(e @ nodes::A_Expr { kind: AEXPR_OP, .. })
@@ -394,7 +391,10 @@ impl QueryParser {
                         if let Some(vector) = vector
                             && let Some(column) = column
                         {
-                            Some(OrderBy::AscVectorL2Column(column.into(), vector))
+                            Some(OrderBy::Column(order_by::OrderByColumn::AscVectorL2(
+                                column.into(),
+                                vector,
+                            )))
                         } else {
                             None
                         }

@@ -167,20 +167,21 @@ impl MultiBinding {
     pub(crate) async fn read(&mut self) -> Result<Option<Message>, Error> {
         loop {
             // Return all sorted data rows if any.
-            if let Some(message) = self.state.get_server_message() {
+            if let Some(message) = self.state.get_server_message()? {
                 return Ok(Some(message));
             }
 
             let mut read = false;
-            for server in &mut self.servers {
-                if !server.has_more_messages() {
-                    continue;
-                }
-
-                let message = server.read().await?;
+            self.state.prepare_read(&self.servers)?;
+            self.state.read_strategy_mut().reset();
+            while let Some(index) = self.state.read_strategy_mut().next_server(&self.servers) {
+                let message = self.servers[index].read().await?;
                 read = true;
 
-                if let Some(message) = self.state.handle_server_message(message)? {
+                if let Some(message) = self
+                    .state
+                    .handle_server_message(self.servers[index].shard, message)?
+                {
                     return Ok(Some(message));
                 }
             }
@@ -233,6 +234,18 @@ impl MultiBinding {
             self.state.update_shards(shards_sent);
         } else {
             self.state.update(shards_sent, client_request.route());
+            if super::result_buffer::can_merge(client_request) {
+                self.state.start_merge(
+                    self.servers
+                        .iter()
+                        .filter(|server| match client_request.route().shard() {
+                            Shard::All => true,
+                            Shard::Multi(shards) => shards.contains(&server.shard),
+                            Shard::Direct(shard) => server.shard == *shard,
+                        })
+                        .map(|server| server.shard),
+                );
+            }
         }
 
         Ok(())

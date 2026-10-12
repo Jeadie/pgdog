@@ -35,6 +35,7 @@ pub(crate) mod direct;
 pub(crate) mod linked_server;
 pub(crate) mod mirror;
 pub(crate) mod multi_shard;
+pub(crate) mod presort_buffer;
 pub(crate) mod transaction;
 
 use aggregate::Aggregates;

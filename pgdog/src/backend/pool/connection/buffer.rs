@@ -9,6 +9,7 @@ use std::{
 use crate::{
     frontend::router::parser::{
         Aggregate, DistinctBy, DistinctColumn, Limit, OrderBy,
+        order_by::{OrderByColumn, OrderByIdx},
         rewrite::statement::projection::ProjectionRewritePlan,
     },
     net::{
@@ -17,7 +18,8 @@ use crate::{
     },
 };
 
-use pgdog_postgres_types::Datum;
+use pgdog_postgres_types::{DataType, Datum, Format};
+use thiserror::Error;
 
 use super::Aggregates;
 
@@ -52,78 +54,15 @@ impl Buffer {
         // fetching indices by name is O (number of columns).
         let mut cols = vec![];
         for column in columns {
-            match column {
-                OrderBy::Asc(_) => cols.push(column.clone()),
-                OrderBy::AscColumn(name) => {
-                    if let Some(index) = decoder.row_description().field_index(name) {
-                        cols.push(OrderBy::Asc(index + 1));
-                    }
-                    // TODO: Error out instead of silently not sorting.
-                }
-                OrderBy::Desc(_) => cols.push(column.clone()),
-                OrderBy::DescColumn(name) => {
-                    if let Some(index) = decoder.row_description().field_index(name) {
-                        cols.push(OrderBy::Desc(index + 1));
-                    }
-                    // TODO: Error out instead of silently not sorting.
-                }
-                OrderBy::AscVectorL2(_, _) => cols.push(column.clone()),
-                OrderBy::AscVectorL2Column(name, vector) => {
-                    if let Some(index) = decoder.row_description().field_index(name) {
-                        cols.push(OrderBy::AscVectorL2(index + 1, vector.clone()));
-                    }
-                    // TODO: Error out instead of silently not sorting.
-                }
+            if let Ok(col_idx) = SortColumn::try_new(column, decoder) {
+                // TODO: Error out instead of silently not sorting.
+                cols.push(col_idx);
             };
         }
 
         // Sort rows.
-        let order_by = move |a: &DataRow, b: &DataRow| -> Ordering {
-            cols.iter()
-                .filter_map(|col| {
-                    let index = col.index();
-                    let asc = col.asc();
-                    let index = index?;
-                    let left = a.get_column(index, decoder);
-                    let right = b.get_column(index, decoder);
-
-                    match (left, right) {
-                        (Ok(Some(left)), Ok(Some(right))) => {
-                            // Handle the special vector case.
-                            if let OrderBy::AscVectorL2(_, vector) = col {
-                                let left: Option<Vector> = left.value.try_into().ok();
-                                let right: Option<Vector> = right.value.try_into().ok();
-
-                                if let (Some(left), Some(right)) = (left, right) {
-                                    let left = left.distance_l2(vector);
-                                    let right = right.distance_l2(vector);
-
-                                    left.partial_cmp(&right)
-                                } else {
-                                    Some(Ordering::Equal)
-                                }
-                            } else {
-                                // FIXME(sage): We don't handle ASC NULLS FIRST or
-                                // DESC NULLS LAST we should either error or add
-                                // support rather than silently do the wrong sorting
-                                match (&left.value, &right.value, asc) {
-                                    (Datum::Null, Datum::Null, _) => Some(Ordering::Equal),
-                                    (Datum::Null, _, true) => Some(Ordering::Greater),
-                                    (_, Datum::Null, true) => Some(Ordering::Less),
-                                    (Datum::Null, _, false) => Some(Ordering::Less),
-                                    (_, Datum::Null, false) => Some(Ordering::Greater),
-                                    (a, b, true) => a.partial_cmp(b),
-                                    (a, b, false) => b.partial_cmp(a),
-                                }
-                            }
-                        }
-
-                        _ => Some(Ordering::Equal),
-                    }
-                })
-                .reduce(Ordering::then)
-                .unwrap_or(Ordering::Equal)
-        };
+        let order_by =
+            move |a: &DataRow, b: &DataRow| -> Ordering { compare_data_row(&cols, a, b) };
 
         self.buffer.make_contiguous().sort_by(order_by);
     }
@@ -235,6 +174,164 @@ impl Buffer {
         self.len() == 0
     }
 }
+#[derive(Debug, Error)]
+pub(crate) enum Error {
+    #[error("\"{0}\" column not found")]
+    ColumnByNameNotFound(String),
+    #[error("column position {0} not found")]
+    ColumnByIndexNotFound(usize),
+    #[error("buffer {0} does not exist")]
+    InvalidBuffer(usize),
+    #[error("buffer {0} has already completed")]
+    BufferComplete(usize),
+    #[error("net: {0}")]
+    Net(#[from] crate::net::Error),
+}
+pub(super) type Result<T, E = Error> = std::result::Result<T, E>;
+
+fn to_index_order_by(column: &OrderBy, decoder: &Decoder) -> Result<OrderByIdx> {
+    match column {
+        OrderBy::Index(idx) => Ok(idx.clone()),
+        OrderBy::Column(OrderByColumn::Asc(name))
+            if let Some(index) = decoder.row_description().field_index(name) =>
+        {
+            Ok(OrderByIdx::Asc(index + 1))
+        }
+        OrderBy::Column(OrderByColumn::Desc(name))
+            if let Some(index) = decoder.row_description().field_index(name) =>
+        {
+            Ok(OrderByIdx::Desc(index + 1))
+        }
+        OrderBy::Column(OrderByColumn::AscVectorL2(name, vector))
+            if let Some(index) = decoder.row_description().field_index(name) =>
+        {
+            Ok(OrderByIdx::AscVectorL2(index + 1, vector.clone()))
+        }
+        OrderBy::Column(col) => Err(Error::ColumnByNameNotFound(col.name().clone())),
+    }
+}
+
+/// Only the sort columns' types and formats are needed after resolving names.
+#[derive(Debug)]
+pub(super) struct SortColumn {
+    order: OrderByIdx,
+    data_type: DataType,
+    format: Format,
+}
+
+impl SortColumn {
+    pub(super) fn try_new(column: &OrderBy, decoder: &Decoder) -> Result<Self> {
+        let order = to_index_order_by(column, decoder)?;
+        let position = match &order {
+            OrderByIdx::Asc(position)
+            | OrderByIdx::Desc(position)
+            | OrderByIdx::AscVectorL2(position, _) => *position,
+        };
+        let index = position
+            .checked_sub(1)
+            .ok_or(Error::ColumnByIndexNotFound(position))?;
+        let field = decoder
+            .row_description()
+            .field(index)
+            .ok_or(Error::ColumnByIndexNotFound(position))?;
+        Ok(Self {
+            data_type: if matches!(order, OrderByIdx::AscVectorL2(..)) {
+                DataType::Vector
+            } else {
+                field.data_type()
+            },
+            format: decoder.get_format(index),
+            order,
+        })
+    }
+
+    /// Types whose PgDog comparison matches PostgreSQL default ordering.
+    /// Text is excluded because its database collation may differ from Rust string ordering.
+    pub(super) fn supports_streaming_merge(&self) -> bool {
+        matches!(self.order, OrderByIdx::AscVectorL2(..))
+            || matches!(
+                self.data_type,
+                DataType::Bigint
+                    | DataType::Integer
+                    | DataType::SmallInt
+                    | DataType::Numeric
+                    | DataType::Real
+                    | DataType::DoublePrecision
+                    | DataType::Bool
+                    | DataType::Uuid
+                    | DataType::Oid
+            )
+    }
+
+    fn decode(&self, row: &DataRow) -> Option<Datum> {
+        let data = row.get_raw(self.order.index())?;
+        Datum::new(&data.data, self.data_type, self.format, data.is_null).ok()
+    }
+}
+
+pub(super) fn compare_data_row(cols: &[SortColumn], a: &DataRow, b: &DataRow) -> Ordering {
+    cols.iter()
+        .filter_map(|col| {
+            let asc = col.order.asc();
+            let left = col.decode(a);
+            let right = col.decode(b);
+
+            match (left, right) {
+                (Some(left), Some(right)) => {
+                    // NULL ordering applies to vector distances as well as scalar keys.
+                    match (&left, &right) {
+                        (Datum::Null, Datum::Null) => return Some(Ordering::Equal),
+                        (Datum::Null, _) => {
+                            return Some(if asc {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            });
+                        }
+                        (_, Datum::Null) => {
+                            return Some(if asc {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            });
+                        }
+                        _ => {}
+                    }
+                    // Handle the special vector case.
+                    if let OrderByIdx::AscVectorL2(_, vector) = &col.order {
+                        let left: Option<Vector> = left.try_into().ok();
+                        let right: Option<Vector> = right.try_into().ok();
+
+                        if let (Some(left), Some(right)) = (left, right) {
+                            let left = left.distance_l2(vector);
+                            let right = right.distance_l2(vector);
+
+                            left.partial_cmp(&right)
+                        } else {
+                            Some(Ordering::Equal)
+                        }
+                    } else {
+                        // FIXME(sage): We don't handle ASC NULLS FIRST or
+                        // DESC NULLS LAST we should either error or add
+                        // support rather than silently do the wrong sorting
+                        match (&left, &right, asc) {
+                            (Datum::Null, Datum::Null, _) => Some(Ordering::Equal),
+                            (Datum::Null, _, true) => Some(Ordering::Greater),
+                            (_, Datum::Null, true) => Some(Ordering::Less),
+                            (Datum::Null, _, false) => Some(Ordering::Less),
+                            (_, Datum::Null, false) => Some(Ordering::Greater),
+                            (a, b, true) => a.partial_cmp(b),
+                            (a, b, false) => b.partial_cmp(a),
+                        }
+                    }
+                }
+
+                _ => Some(Ordering::Equal),
+            }
+        })
+        .reduce(Ordering::then)
+        .unwrap_or(Ordering::Equal)
+}
 
 #[cfg(test)]
 mod test {
@@ -246,7 +343,10 @@ mod test {
     fn test_sort_buffer() {
         let mut buf = Buffer::default();
         let rd = RowDescription::new(&[Field::bigint("one"), Field::text("two")]);
-        let columns = [OrderBy::Asc(1), OrderBy::Desc(2)];
+        let columns = [
+            OrderBy::Index(OrderByIdx::Asc(1)),
+            OrderBy::Index(OrderByIdx::Desc(2)),
+        ];
 
         for i in 0..25_i64 {
             let mut dr = DataRow::new();
@@ -328,7 +428,7 @@ mod test {
     fn test_sort_buffer_with_timestamps() {
         let mut buf = Buffer::default();
         let rd = RowDescription::new(&[Field::timestamp("created_at"), Field::text("name")]);
-        let columns = [OrderBy::Asc(1)]; // Sort by timestamp column
+        let columns = [OrderBy::Index(OrderByIdx::Asc(1))]; // Sort by timestamp column
 
         // Add timestamps in random order
         let timestamps = [
@@ -371,7 +471,7 @@ mod test {
     fn test_sort_buffer_with_numeric() {
         let mut buf = Buffer::default();
         let rd = RowDescription::new(&[Field::numeric("price"), Field::text("product")]);
-        let columns = [OrderBy::Desc(1)]; // Sort by numeric column descending
+        let columns = [OrderBy::Index(OrderByIdx::Desc(1))]; // Sort by numeric column descending
 
         // Add numeric values in random order
         let prices = [
@@ -421,7 +521,7 @@ mod test {
     fn test_sort_buffer_with_numeric_binary() {
         let mut buf = Buffer::default();
         let rd = RowDescription::new(&[Field::numeric_binary("price"), Field::text("product")]);
-        let columns = [OrderBy::Desc(1)]; // Sort by numeric column descending
+        let columns = [OrderBy::Index(OrderByIdx::Desc(1))]; // Sort by numeric column descending
 
         // Test values with their expected binary representations
         let test_cases = [
@@ -467,7 +567,7 @@ mod test {
     fn test_sort_buffer_with_numeric_edge_cases() {
         let mut buf = Buffer::default();
         let rd = RowDescription::new(&[Field::numeric("value"), Field::text("description")]);
-        let columns = [OrderBy::Asc(1)]; // Sort by numeric column ascending
+        let columns = [OrderBy::Index(OrderByIdx::Asc(1))]; // Sort by numeric column ascending
 
         // Test edge cases: negative numbers, very large numbers, very small decimals, zero
         let values = [
