@@ -23,6 +23,12 @@ pub(crate) enum Error {
     )]
     InconsistentDataRowCount { expected: usize, actual: usize },
 
+    #[error("{0}")]
+    Buffer(#[from] super::super::buffer::Error),
+
+    #[error("shard {0} has no merge stream")]
+    InvalidMergeShard(usize),
+
     #[error("net error: {0}")]
     Net(#[from] crate::net::Error),
 }

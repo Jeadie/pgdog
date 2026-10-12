@@ -13,10 +13,12 @@ use crate::{
     },
 };
 
-use super::{LinkedServer, buffer::Buffer};
+use super::LinkedServer;
+use result_buffer::{MergeState, ResultBuffer};
 
 mod binding;
 mod error;
+mod result_buffer;
 #[cfg(test)]
 mod test;
 mod upgrade;
@@ -107,7 +109,7 @@ pub(crate) struct MultiShard {
     /// In-flight request state.
     request_state: RequestState,
     /// Sorting/aggregate buffer.
-    buffer: Buffer,
+    buffer: ResultBuffer,
     /// Server read policy for the current query.
     read_strategy: ReadStrategy,
     /// Row decoder.
@@ -156,7 +158,7 @@ impl MultiShard {
 
     fn reset(&mut self) {
         self.request_state = RequestState::default();
-        self.buffer = Buffer::default();
+        self.buffer = ResultBuffer::default();
         self.read_strategy = ReadStrategy::default();
         self.validator.reset();
 
@@ -179,6 +181,33 @@ impl MultiShard {
         };
     }
 
+    /// Choose a merge buffer once the binding knows the participating shard IDs.
+    pub(super) fn start_merge(&mut self, shard_ids: impl Iterator<Item = usize>) {
+        if self.should_buffer() {
+            self.buffer = ResultBuffer::Merge(MergeState::new(shard_ids));
+        }
+    }
+
+    /// Merge reads request a missing candidate; cleanup reads still use Specific.
+    pub(super) fn prepare_read(&mut self, servers: &[LinkedServer]) -> Result<(), Error> {
+        if let ResultBuffer::Merge(merge) = &self.buffer {
+            let descriptions_pending = self.request_state.row_description > 0
+                && !self
+                    .request_state
+                    .row_description
+                    .is_multiple_of(self.shards);
+            let shard_id = merge.next_shard(
+                servers,
+                !self.bound_statements.is_empty(),
+                descriptions_pending,
+            )?;
+            if let Some(shard_id) = shard_id {
+                self.read_from(shard_id);
+            }
+        }
+        Ok(())
+    }
+
     /// Check if the message we received from Postgres should be sent to the client, skipped,
     /// or modified.
     ///
@@ -192,14 +221,19 @@ impl MultiShard {
     ///
     pub(super) fn handle_server_message(
         &mut self,
+        shard_id: usize,
         message: Message,
     ) -> Result<Option<Message>, Error> {
+        let buffer_id = self
+            .buffer
+            .observe_server_message(shard_id, message.code())?;
+
         Ok(match message.code() {
             'Z' => self.handle_ready_for_query(message)?,
-            'C' => self.handle_command_complete(message)?,
+            'C' => self.handle_command_complete(message, buffer_id)?,
             'T' => self.handle_row_description(message)?,
             'I' => self.handle_empty_query_response(message)?,
-            'D' => self.handle_data_row(message)?,
+            'D' => self.handle_data_row(message, buffer_id)?,
             'G' => Self::handle_passthrough(message, &mut self.request_state.copy_in, self.shards),
             'n' => Self::handle_passthrough(message, &mut self.request_state.no_data, self.shards),
             '1' => Self::handle_passthrough(
@@ -227,20 +261,33 @@ impl MultiShard {
         })
     }
 
-    // pub(super) fn order_servers(&self, shard_ids: &[&usize]) -> usize {
-    //     self.buffer.
-    // }
-
     /// Get the next available server message to send to the client.
     ///
     /// Used when buffering and transforming messages. This returns [`None`] until
     /// the state is ready, i.e., we received everything we need to sort/limit/offset, etc.
     ///
-    pub(super) fn get_server_message(&mut self) -> Option<Message> {
-        match self.buffer.take() {
-            Some(data_row) => Some(data_row),
-            _ => self.request_state.command_complete.take(),
+    pub(super) fn get_server_message(&mut self) -> Result<Option<Message>, Error> {
+        // Do not expose rows before all shard descriptions have been validated.
+        if self.request_state.row_description > 0
+            && !self
+                .request_state
+                .row_description
+                .is_multiple_of(self.shards)
+        {
+            return Ok(None);
         }
+        let row = self.buffer.take(&self.route);
+        if row.is_some() {
+            return Ok(row);
+        }
+        if let Some(message) = self.request_state.command_complete.take() {
+            if let ResultBuffer::Merge(merge) = &self.buffer {
+                let cc = CommandComplete::from_bytes(message.to_bytes())?;
+                return Ok(Some(cc.rewrite(merge.returned)?.message()));
+            }
+            return Ok(Some(message));
+        }
+        Ok(None)
     }
 
     /// The state has more messages for the client.
@@ -284,7 +331,19 @@ impl MultiShard {
     //
     // Once all shards finished executing the command,
     // we can start aggregating and sorting.
-    fn handle_command_complete(&mut self, message: Message) -> Result<Option<Message>, Error> {
+    fn handle_command_complete(
+        &mut self,
+        message: Message,
+        buffer_id: Option<usize>,
+    ) -> Result<Option<Message>, Error> {
+        if !self.buffer.ensure_initialized(&self.route, &self.decoder)? {
+            self.read_strategy = ReadStrategy::default();
+        }
+        if let (ResultBuffer::Merge(merge), Some(buffer_id)) = (&mut self.buffer, buffer_id)
+            && let Some(buffer) = &mut merge.buffer
+        {
+            buffer.mark_complete(buffer_id)?;
+        }
         let cc = CommandComplete::from_bytes(message.to_bytes())?;
 
         // DDL commands don't return rows.
@@ -309,31 +368,36 @@ impl MultiShard {
             .command_complete_count
             .is_multiple_of(self.shards)
         {
-            self.buffer.mark_full();
+            if let ResultBuffer::Full(buffer) = &mut self.buffer {
+                buffer.mark_full();
 
-            if !self.buffer.is_empty() {
-                // Helpers remain in the internal row through aggregation and
-                // sorting, then are removed before client-visible operations.
-                self.buffer
-                    .aggregate(
-                        self.route.aggregate(),
-                        &self.decoder,
-                        &self.route.projection_rewrite_plan,
-                    )
-                    .map_err(Error::from)?;
+                if !buffer.is_empty() {
+                    // Helpers remain in the internal row through aggregation and
+                    // sorting, then are removed before client-visible operations.
+                    buffer
+                        .aggregate(
+                            self.route.aggregate(),
+                            &self.decoder,
+                            &self.route.projection_rewrite_plan,
+                        )
+                        .map_err(Error::from)?;
 
-                self.buffer.sort(self.route.order_by(), &self.decoder);
-                self.buffer
-                    .drop_helper_columns(&self.route.projection_rewrite_plan, &self.decoder);
-                self.buffer.distinct(self.route.distinct(), &self.decoder);
-                self.buffer.limit(self.route.limit());
+                    buffer.sort(self.route.order_by(), &self.decoder);
+                    buffer.drop_helper_columns(&self.route.projection_rewrite_plan, &self.decoder);
+                    buffer.distinct(self.route.distinct(), &self.decoder);
+                    buffer.limit(self.route.limit());
+                }
             }
 
             if has_rows {
-                let rows = if self.should_buffer() {
-                    self.buffer.len()
-                } else {
-                    self.request_state.rows
+                let rows = match &self.buffer {
+                    ResultBuffer::Full(buffer) if self.should_buffer() => buffer.len(),
+                    ResultBuffer::Merge(_) => {
+                        // The merge may still contain rows. Rewrite the count when consumed.
+                        self.request_state.command_complete = Some(cc.message());
+                        return Ok(None);
+                    }
+                    _ => self.request_state.rows,
                 };
                 self.request_state.command_complete = Some(cc.rewrite(rows)?.message());
             } else {
@@ -358,6 +422,18 @@ impl MultiShard {
         // can use it.
         if is_first_in_group {
             self.decoder.set_row_description(rd.clone());
+        } else if matches!(self.buffer, ResultBuffer::Merge(_))
+            && self
+                .decoder
+                .row_description()
+                .fields
+                .iter()
+                .zip(rd.fields.iter())
+                .any(|(left, right)| left.data_type() != right.data_type())
+        {
+            // The legacy validator permits differing types. Preserve its buffered behavior.
+            self.buffer = ResultBuffer::default();
+            self.read_strategy = ReadStrategy::default();
         }
 
         if self
@@ -398,7 +474,14 @@ impl MultiShard {
         )
     }
 
-    fn handle_data_row(&mut self, message: Message) -> Result<Option<Message>, Error> {
+    fn handle_data_row(
+        &mut self,
+        message: Message,
+        buffer_id: Option<usize>,
+    ) -> Result<Option<Message>, Error> {
+        if !self.buffer.ensure_initialized(&self.route, &self.decoder)? {
+            self.read_strategy = ReadStrategy::default();
+        }
         let mut forward = None;
 
         if self.shards > 1 {
@@ -428,7 +511,15 @@ impl MultiShard {
                 forward = Some(message);
             }
         } else {
-            self.buffer.add(message).map_err(Error::from)?;
+            match &mut self.buffer {
+                ResultBuffer::Full(buffer) => buffer.add(message).map_err(Error::from)?,
+                ResultBuffer::Merge(merge) if !merge.draining => {
+                    if let (Some(buffer), Some(buffer_id)) = (&mut merge.buffer, buffer_id) {
+                        buffer.add(buffer_id, message)?;
+                    }
+                }
+                ResultBuffer::Merge(_) => {}
+            }
         }
 
         Ok(forward)

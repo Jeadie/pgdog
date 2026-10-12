@@ -56,7 +56,7 @@ impl MergePreSortBuffer {
         })
     }
 
-    pub(super) fn take(&mut self) -> Option<Message> {
+    pub(super) fn take(&mut self) -> Option<DataRow> {
         if !self.can_take() {
             return None;
         }
@@ -71,7 +71,7 @@ impl MergePreSortBuffer {
             self.missing += 1;
         }
 
-        Some(row.message())
+        Some(row)
     }
 
     pub(super) fn can_take(&self) -> bool {
@@ -360,32 +360,55 @@ mod test {
 
     #[test]
     fn eager_merge_orders_buffer_heads_by_vector_distance() {
-        let mut field = Field::text("embedding");
-        // Extension OIDs are unknown until schema introspection; vector sorts
-        // can still decode their text values.
-        field.type_oid = 99_999;
-        let decoder = Decoder::from(RowDescription::new(&[field]));
-        let columns = [OrderBy::Column(OrderByColumn::AscVectorL2(
-            "embedding".into(),
-            Vector::from(vec![0.0_f32, 0.0, 0.0]),
-        ))];
-        let mut buffer =
-            MergePreSortBuffer::try_new(2, &columns, &decoder).expect("valid ordering");
-        drop(decoder);
-        for (buffer_id, vectors) in [(0, ["[-1,0,0]", "[-4,0,0]"]), (1, ["[2,0,0]", "[3,0,0]"])] {
-            for vector in vectors {
-                let mut row = DataRow::new();
-                row.add(vector);
-                buffer.add(buffer_id, row.message()).expect("valid stream");
+        use crate::net::Bind;
+        use pgdog_postgres_types::FromDataType;
+
+        for format in [Format::Text, Format::Binary] {
+            let mut field = Field::text("embedding");
+            // Extension OIDs can differ from built-in types; decode using the vector sort key.
+            field.type_oid = 99_999;
+            let mut decoder = Decoder::from(RowDescription::new(&[field]));
+            decoder.set_formats(&Bind::new_params_codes_results(
+                "",
+                &[],
+                &[],
+                &[if format == Format::Text { 0 } else { 1 }],
+            ));
+            let columns = [OrderBy::Column(OrderByColumn::AscVectorL2(
+                "embedding".into(),
+                Vector::from(vec![0.0_f32, 0.0, 0.0]),
+            ))];
+            let mut buffer =
+                MergePreSortBuffer::try_new(3, &columns, &decoder).expect("valid ordering");
+            drop(decoder);
+            for (buffer_id, vectors) in [(0, ["[-1,0,0]", "[-4,0,0]"]), (1, ["[2,0,0]", "[3,0,0]"])]
+            {
+                for vector in vectors {
+                    let mut row = DataRow::new();
+                    row.add(
+                        Vector::decode(vector.as_bytes(), Format::Text)
+                            .unwrap()
+                            .encode(format)
+                            .unwrap(),
+                    );
+                    buffer.add(buffer_id, row.message()).expect("valid stream");
+                }
+                buffer.mark_complete(buffer_id).expect("valid stream");
             }
-            buffer.mark_complete(buffer_id).expect("valid stream");
+            let mut null = DataRow::new();
+            null.add(None::<i64>);
+            buffer.add(2, null.message()).unwrap();
+            buffer.mark_complete(2).unwrap();
+            for expected in ["[-1,0,0]", "[2,0,0]", "[3,0,0]", "[-4,0,0]"] {
+                let row = buffer.take().expect("merged row");
+                assert_eq!(
+                    row.get::<Vector>(0, format).unwrap(),
+                    Vector::decode(expected.as_bytes(), Format::Text).unwrap()
+                );
+            }
+            assert!(buffer.take().unwrap().get_raw(0).unwrap().is_null);
+            assert!(buffer.take().is_none());
         }
-        for expected in ["[-1,0,0]", "[2,0,0]", "[3,0,0]", "[-4,0,0]"] {
-            let message = buffer.take().expect("merged row");
-            let row = DataRow::from_bytes(message.to_bytes()).expect("valid row");
-            assert_eq!(row.get_text(0).as_deref(), Some(expected));
-        }
-        assert!(buffer.take().is_none());
     }
 
     #[test]

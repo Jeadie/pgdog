@@ -235,10 +235,32 @@ impl SortColumn {
             .field(index)
             .ok_or(Error::ColumnByIndexNotFound(position))?;
         Ok(Self {
-            order,
-            data_type: field.data_type(),
+            data_type: if matches!(order, OrderByIdx::AscVectorL2(..)) {
+                DataType::Vector
+            } else {
+                field.data_type()
+            },
             format: decoder.get_format(index),
+            order,
         })
+    }
+
+    /// Types whose PgDog comparison matches PostgreSQL default ordering.
+    /// Text is excluded because its database collation may differ from Rust string ordering.
+    pub(super) fn supports_streaming_merge(&self) -> bool {
+        matches!(self.order, OrderByIdx::AscVectorL2(..))
+            || matches!(
+                self.data_type,
+                DataType::Bigint
+                    | DataType::Integer
+                    | DataType::SmallInt
+                    | DataType::Numeric
+                    | DataType::Real
+                    | DataType::DoublePrecision
+                    | DataType::Bool
+                    | DataType::Uuid
+                    | DataType::Oid
+            )
     }
 
     fn decode(&self, row: &DataRow) -> Option<Datum> {
@@ -256,6 +278,25 @@ pub(super) fn compare_data_row(cols: &[SortColumn], a: &DataRow, b: &DataRow) ->
 
             match (left, right) {
                 (Some(left), Some(right)) => {
+                    // NULL ordering applies to vector distances as well as scalar keys.
+                    match (&left, &right) {
+                        (Datum::Null, Datum::Null) => return Some(Ordering::Equal),
+                        (Datum::Null, _) => {
+                            return Some(if asc {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            });
+                        }
+                        (_, Datum::Null) => {
+                            return Some(if asc {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            });
+                        }
+                        _ => {}
+                    }
                     // Handle the special vector case.
                     if let OrderByIdx::AscVectorL2(_, vector) = &col.order {
                         let left: Option<Vector> = left.try_into().ok();
