@@ -90,7 +90,7 @@ if [ "${LOAD_DATA}" = "1" ]; then
         echo "Loading ${ROWS} rows into shard_${s}"
         pg psql -U pgdog -h 127.0.0.1 -d pgdog -qc "CREATE DATABASE shard_${s}"
         pg psql -U pgdog -h 127.0.0.1 -d "shard_${s}" -v ON_ERROR_STOP=1 -q <<EOF
-SELECT setseed(0.${s}1);
+SELECT setseed(0.${s}1) \gset
 CREATE TABLE bench (
     id     BIGINT PRIMARY KEY,           -- globally unique: k * SHARDS + shard
     score  DOUBLE PRECISION NOT NULL,    -- uniform random in [0, 1)
