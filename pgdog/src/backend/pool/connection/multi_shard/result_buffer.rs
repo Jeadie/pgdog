@@ -175,7 +175,9 @@ impl MergeState {
         )?);
         self.drop_columns = route
             .projection_rewrite_plan
-            .drop_columns(decoder.row_description());
+            .as_deref()
+            .map(|plan| plan.drop_columns(decoder.row_description()))
+            .unwrap_or_default();
         Ok(true)
     }
 

@@ -457,6 +457,10 @@ pub struct General {
     #[serde(default = "General::default_passthrough_auth")]
     pub passthrough_auth: PassthroughAuth,
 
+    /// Passthrough auth debounce delay.
+    #[serde(default = "General::passthrough_auth_debounce_delay")]
+    pub passthrough_auth_debounce_delay: u64,
+
     /// Maximum amount of time to allow for PgDog to create a connection to Postgres.
     ///
     /// _Default:_ `5000`
@@ -793,6 +797,17 @@ pub struct General {
     #[serde(default = "General::resharding_parallel_copies")]
     pub resharding_parallel_copies: usize,
 
+    /// How many source copies we'll launch for a singular table copy.
+    /// Recommended when dealing with TOAST-heavy tables, which usually
+    /// cost multiple disk reads and bound the stream by read latency,
+    /// especially with a cold cache.
+    ///
+    /// When used effectively, this will massively speed up table copies
+    /// by a factor of what this is set to (e.g., 30x, depending on disk IOPS),
+    /// fully utilizing the disk IOPS.
+    #[serde(default = "General::resharding_parallel_within_table_copies")]
+    pub resharding_parallel_within_table_copies: usize,
+
     /// Maximum number of retries for a failed table copy during resharding (per-table).
     /// Retries use exponential backoff starting at `resharding_copy_retry_min_delay`.
     /// _Default:_ `5`
@@ -890,14 +905,6 @@ pub struct General {
     #[serde(default = "General::cutover_timeout_action")]
     pub cutover_timeout_action: CutoverTimeoutAction,
 
-    /// Save the swapped configuration to disk after a traffic cutover. When enabled, PgDog will backup both configuration files as `pgdog.bak.toml` and `users.bak.toml`, and write the new configuration to `pgdog.toml` and `users.toml`.
-    ///
-    /// _Default:_ `false`
-    ///
-    /// <https://docs.pgdog.dev/configuration/pgdog.toml/general/#cutover_save_config>
-    #[serde(default)]
-    pub cutover_save_config: bool,
-
     /// Size of the client token passthrough cache.
     #[serde(default = "General::auth_token_cache_size")]
     pub auth_token_cache_size: u64,
@@ -958,6 +965,7 @@ impl Default for General {
             prepared_statements_ttl_jitter: Self::default_prepared_statements_ttl_jitter(),
             query_cache_limit: Self::query_cache_limit(),
             passthrough_auth: Self::default_passthrough_auth(),
+            passthrough_auth_debounce_delay: Self::passthrough_auth_debounce_delay(),
             connect_timeout: Self::default_connect_timeout(),
             connect_attempt_delay: Self::default_connect_attempt_delay(),
             connect_attempts: Self::connect_attempts(),
@@ -1003,6 +1011,8 @@ impl Default for General {
             sharding_lookup_cache_size: Self::sharding_lookup_cache_size(),
             sharding_lookup_timeout: Self::sharding_lookup_timeout(),
             resharding_parallel_copies: Self::resharding_parallel_copies(),
+            resharding_parallel_within_table_copies: Self::resharding_parallel_within_table_copies(
+            ),
             resharding_copy_retry_max_attempts: Self::resharding_copy_retry_max_attempts(),
             resharding_copy_retry_min_delay: Self::resharding_copy_retry_min_delay(),
             resharding_replication_retry_max_attempts:
@@ -1016,7 +1026,6 @@ impl Default for General {
             cutover_last_transaction_delay: Self::cutover_last_transaction_delay(),
             cutover_timeout: Self::cutover_timeout(),
             cutover_timeout_action: Self::cutover_timeout_action(),
-            cutover_save_config: bool::default(),
             unique_id_function: Self::unique_id_function(),
             auth_token_cache_size: Self::auth_token_cache_size(),
         }
@@ -1281,6 +1290,10 @@ impl General {
         1
     }
 
+    fn resharding_parallel_within_table_copies() -> usize {
+        1
+    }
+
     fn resharding_copy_retry_max_attempts() -> usize {
         5
     }
@@ -1486,7 +1499,7 @@ impl General {
     }
 
     pub fn prepared_statements_limit() -> usize {
-        Self::env_or_default("PGDOG_PREPARED_STATEMENTS_LIMIT", i64::MAX as usize)
+        Self::env_or_default("PGDOG_PREPARED_STATEMENTS_LIMIT", 5_000)
     }
 
     fn default_prepared_statements_ttl() -> Option<u64> {
@@ -1559,6 +1572,10 @@ impl General {
         } else {
             PassthroughAuth::default()
         }
+    }
+
+    fn passthrough_auth_debounce_delay() -> u64 {
+        Self::env_or_default("PGDOG_PASSTHROUGH_AUTH_DEBOUNCE_DELAY", 1_000)
     }
 
     fn auth_token_cache_size() -> u64 {
@@ -2075,7 +2092,7 @@ mod tests {
 
         assert_eq!(General::broadcast_port(), General::port() + 1);
         assert_eq!(General::openmetrics_port(), None);
-        assert_eq!(General::prepared_statements_limit(), i64::MAX as usize);
+        assert_eq!(General::prepared_statements_limit(), 5_000);
         assert_eq!(General::default_prepared_statements_ttl(), None);
         assert_eq!(General::default_prepared_statements_ttl_jitter(), 30_000);
         assert_eq!(General::query_cache_limit(), 1_000);

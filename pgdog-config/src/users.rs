@@ -7,8 +7,8 @@ use tracing::warn;
 
 use super::core::Config;
 use super::pooling::PoolerMode;
-use crate::RoleConfig;
 use crate::util::random_string;
+use crate::{AuthType, ReadWriteSplit, RoleConfig};
 use schemars::JsonSchema;
 
 /// Plugins are dynamically loaded at PgDog startup. These settings control which plugins are loaded.
@@ -51,10 +51,7 @@ impl Users {
     pub fn check(&mut self, config: &Config) {
         for user in &mut self.users {
             if user.passwords().is_empty() {
-                if !config.general.passthrough_auth()
-                    && user.identity.is_none()
-                    && !config.general.auth_type.external_token()
-                {
+                if user.requires_password(config) {
                     warn!(
                         r#"user "{}" (database "{}") doesn't have a password, while passthrough auth, external token, and mTLS auth are disabled"#,
                         user.name, user.database,
@@ -72,6 +69,7 @@ impl Users {
                         if min_pool_size > 0
                             && user.server_password.is_none()
                             && user.server_auth == ServerAuth::Password
+                            && !config.general.passthrough_auth()
                         {
                             warn!(
                                 r#"user "{}" (database "{}") does not have a password configured, PgDog cannot connect to the server to maintain "min_pool_size" of {}, setting it to 0"#,
@@ -232,7 +230,7 @@ impl ServerAuth {
 }
 
 /// The kind of password configured on the user.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PasswordKind {
     Plain(String),
     Hashed(String),
@@ -420,9 +418,26 @@ pub struct User {
     ///
     #[serde(flatten, default)]
     pub role_config: RoleConfig,
+
+    /// Client auth type, overrides the same setting in [general].
+    pub auth_type: Option<AuthType>,
+
+    /// Read-write split algorithm to use for this user.
+    pub read_write_split: Option<ReadWriteSplit>,
 }
 
 impl User {
+    /// The user can't log in without a password: no passthrough auth,
+    /// external token or mTLS identity.
+    fn requires_password(&self, config: &Config) -> bool {
+        !config.general.passthrough_auth()
+            && self.identity.is_none()
+            && !self
+                .auth_type
+                .unwrap_or(config.general.auth_type)
+                .external_token()
+    }
+
     fn password(&self) -> &str {
         if let Some(ref s) = self.password {
             s.as_str()
@@ -877,6 +892,25 @@ vault_refresh_percent = 60
     fn test_vault_static_is_external_identity() {
         assert!(ServerAuth::VaultStatic.is_external_identity());
         assert!(ServerAuth::VaultDynamic.is_external_identity());
+    }
+
+    #[test]
+    fn test_requires_password_uses_user_auth_type() {
+        let mut config = crate::Config::default();
+        let user = |auth_type| User {
+            name: "alice".into(),
+            database: "db".into(),
+            auth_type,
+            ..Default::default()
+        };
+
+        config.general.auth_type = AuthType::Scram;
+        assert!(user(None).requires_password(&config));
+        assert!(!user(Some(AuthType::ExternalToken)).requires_password(&config));
+
+        config.general.auth_type = AuthType::ExternalToken;
+        assert!(!user(None).requires_password(&config));
+        assert!(user(Some(AuthType::Scram)).requires_password(&config));
     }
 
     #[test]

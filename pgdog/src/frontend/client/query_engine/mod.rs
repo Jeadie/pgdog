@@ -3,8 +3,9 @@ use crate::{
     config::config,
     frontend::{
         BufferedQuery, Client, ClientComms, ClientRequest, Command, DiscardTarget, Error, Router,
-        RouterContext, Stats,
+        RouterContext, Stats, UnlistenTarget,
         client::query_engine::{hooks::QueryEngineHooks, route_query::ClusterCheck},
+        prepared_statements::Error as PreparedStatementError,
         router::{Route, parser::Shard},
     },
     net::{ErrorResponse, Message, Parameters},
@@ -75,6 +76,8 @@ pub(crate) struct QueryEngine {
     // or disconnect.
     manual_lock: bool,
     temp_tables: TempTables,
+    // Count how many rows we received from the query we are currently executing.
+    result_row_counter: usize,
 }
 
 impl QueryEngine {
@@ -102,6 +105,7 @@ impl QueryEngine {
             advisory_locks: AdvisoryLocks::default(),
             manual_lock: false,
             temp_tables: Default::default(),
+            result_row_counter: 0,
         })
     }
 
@@ -142,14 +146,22 @@ impl QueryEngine {
         self.stats.received(client_request.total_message_len());
         self.set_state(State::Active); // Client is active.
 
-        if self.in_extended_pipeline_error(context, client_request) {
+        if self.discard_until_sync(client_request) {
+            self.update_stats(context);
             return Ok(QueryEngineResult::Done(context.transaction()));
         }
 
         log_query_stdout(context, client_request);
 
         // Rewrite prepared statements.
-        self.rewrite_extended(context, &mut client_request.messages)?;
+        if let Err(error) = self.rewrite_extended(context, &mut client_request.messages) {
+            if let PreparedStatementError::MissingStatement(name) = &error {
+                self.send_error_response(context, ErrorResponse::missing_prepared_statement(name))
+                    .await?;
+                return Ok(QueryEngineResult::Done(context.transaction()));
+            }
+            return Err(error.into());
+        }
 
         if let ClusterCheck::Offline = self.cluster_check(context, client_request).await? {
             return Ok(QueryEngineResult::Done(context.transaction()));
@@ -196,7 +208,7 @@ impl QueryEngine {
         // This is here because ROLLBACK and COMMIT
         // can be handled by a separate path than [`QueryEngine::execute`],
         // e.g., if using two-phase commit.
-        self.check_lock();
+        self.sync_lock();
 
         let command = self.router.command();
 
@@ -218,26 +230,18 @@ impl QueryEngine {
             Command::StartTransaction {
                 query,
                 transaction_type,
-                extended,
                 ..
             } => {
-                self.start_transaction(
-                    context,
-                    client_request,
-                    query.clone(),
-                    *transaction_type,
-                    *extended,
-                )
-                .await?
+                self.start_transaction(context, client_request, query.clone(), *transaction_type)
+                    .await?
             }
-            Command::CommitTransaction { extended, .. } => {
+            Command::CommitTransaction { .. } => {
                 if self.backend.connected() {
                     // Transaction control statements should be excluded from cross-shard checks.
                     context.cross_shard_disabled = Some(false);
-                    self.end_connected(context, client_request, false, *extended)
-                        .await?;
+                    self.end_connected(context, client_request, false).await?;
                 } else {
-                    self.end_not_connected(context, client_request, false, *extended)
+                    self.end_not_connected(context, client_request, false)
                         .await?
                 }
 
@@ -245,14 +249,13 @@ impl QueryEngine {
                     self.comms.update_params(context.params);
                 }
             }
-            Command::RollbackTransaction { extended, .. } => {
+            Command::RollbackTransaction { .. } => {
                 if self.backend.connected() {
                     // Transaction control statements should be excluded from cross-shard checks.
                     context.cross_shard_disabled = Some(false);
-                    self.end_connected(context, client_request, true, *extended)
-                        .await?;
+                    self.end_connected(context, client_request, true).await?;
                 } else {
-                    self.end_not_connected(context, client_request, true, *extended)
+                    self.end_not_connected(context, client_request, true)
                         .await?
                 }
 
@@ -293,8 +296,8 @@ impl QueryEngine {
                 )
                 .await?
             }
-            Command::Unlisten(channel) => {
-                self.unlisten(context, &client_request.messages, &channel.clone())
+            Command::Unlisten(target) => {
+                self.unlisten(context, &client_request.messages, &target.clone())
                     .await?
             }
             Command::Set {

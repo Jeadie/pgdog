@@ -143,8 +143,7 @@ impl Shard {
     }
 
     /// Fetch schema from the shard. This does not use the
-    /// cache and returns the freshed schema available.
-    ///
+    /// cache and returns the freshest schema available.
     pub(crate) async fn fetch_schema(&self) -> Result<Schema, crate::backend::Error> {
         let mut server = self.primary_or_replica(&Request::default()).await?;
         let schema = Schema::load(&mut server).await?;
@@ -272,6 +271,10 @@ impl Shard {
     /// the schema was not yet loaded.
     pub(crate) fn schema(&self) -> Schema {
         self.schema.get().cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn loaded_schema(&self) -> Option<&Schema> {
+        self.schema.get()
     }
 
     /// Re-detect primary/replica roles and re-build

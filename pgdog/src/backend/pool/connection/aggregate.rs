@@ -15,10 +15,11 @@ use crate::{
 };
 use pgdog_postgres_types::Error as TypeError;
 
-use super::Error;
+pub(crate) use error::Error;
 
 mod avg;
 mod cmp;
+mod error;
 mod sum;
 mod variance;
 #[path = "aggregate/count.rs"]
@@ -31,16 +32,27 @@ struct Grouping {
 }
 
 impl Grouping {
-    fn new(row: &DataRow, group_by: &[usize], decoder: &Decoder) -> Result<Self, Error> {
+    fn new(row: &DataRow, group_by: &[usize], decoder: &Decoder) -> Self {
         let mut columns = vec![];
         for idx in group_by {
-            let column = row.get_column(*idx, decoder)?;
-            if let Some(column) = column {
-                columns.push((*idx, column.value));
+            let value = match row.get_column(*idx, decoder) {
+                Ok(column) => column.map(|column| column.value),
+                // Equal keys have identical output text, so a key PgDog can't
+                // decode (e.g. timestamptz with a +05:30 offset) groups by its bytes.
+                Err(_) => row.get_raw(*idx).map(|data| {
+                    if data.is_null {
+                        Datum::Null
+                    } else {
+                        Datum::Unknown(data.data.clone())
+                    }
+                }),
+            };
+            if let Some(value) = value {
+                columns.push((*idx, value));
             }
         }
 
-        Ok(Self { columns })
+        Self { columns }
     }
 }
 
@@ -245,7 +257,7 @@ impl<'a> Aggregates<'a> {
         rows: &'a VecDeque<DataRow>,
         decoder: &'a Decoder,
         aggregate: &'a Aggregate,
-        plan: &ProjectionRewritePlan,
+        plan: Option<&ProjectionRewritePlan>,
     ) -> Option<Self> {
         let mut helper_columns: HashMap<usize, HelperColumns> = HashMap::new();
 
@@ -262,16 +274,18 @@ impl<'a> Aggregates<'a> {
             }
         }
 
-        for helper in &plan.aggregate_helpers {
-            let Some(index) = decoder.row_description().field_index(&helper.alias) else {
-                continue;
-            };
+        if let Some(plan) = plan {
+            for helper in &plan.aggregate_helpers {
+                let Some(index) = decoder.row_description().field_index(&helper.alias) else {
+                    continue;
+                };
 
-            let entry = helper_columns.entry(helper.target_column).or_default();
-            match helper.kind {
-                HelperKind::Count => entry.count = Some(index),
-                HelperKind::Sum => entry.sum = Some(index),
-                HelperKind::SumSquares => entry.sumsq = Some(index),
+                let entry = helper_columns.entry(helper.target_column).or_default();
+                match helper.kind {
+                    HelperKind::Count => entry.count = Some(index),
+                    HelperKind::Sum => entry.sum = Some(index),
+                    HelperKind::SumSquares => entry.sumsq = Some(index),
+                }
             }
         }
 
@@ -328,7 +342,7 @@ impl<'a> Aggregates<'a> {
             (0..num_cols).filter(|idx| !covered_indices[*idx]).collect();
 
         for row in self.rows {
-            let grouping = Grouping::new(row, self.aggregate.group_by(), self.decoder)?;
+            let grouping = Grouping::new(row, self.aggregate.group_by(), self.decoder);
             let entry = match self.mappings.entry(grouping) {
                 Entry::Occupied(o) => o.into_mut(),
                 Entry::Vacant(v) => {
@@ -523,8 +537,7 @@ mod test {
         shard1.add("3");
         rows.push_back(shard1);
 
-        let plan = ProjectionRewritePlan::default();
-        let mut result = Aggregates::new(&rows, &decoder, &aggregate, &plan)
+        let mut result = Aggregates::new(&rows, &decoder, &aggregate, None)
             .unwrap()
             .aggregate()
             .unwrap();
@@ -537,7 +550,7 @@ mod test {
 
     #[test]
     fn aggregate_count_preserves_binary_result_types() {
-        use pgdog_postgres_types::Float;
+        use pgdog_postgres_types::{Float, Numeric};
 
         for (cast, oid, partial, expected) in [
             ("smallint", 21, Datum::SmallInt(3), Datum::SmallInt(6)),
@@ -555,6 +568,12 @@ mod test {
                 Datum::Double(Double(3.0)),
                 Datum::Double(Double(6.0)),
             ),
+            (
+                "numeric",
+                1700,
+                Datum::Numeric(Numeric::from(3_i64)),
+                Datum::Numeric(Numeric::from(6_i64)),
+            ),
         ] {
             let aggregate = parse(&format!("SELECT COUNT(*)::{cast} FROM users"));
             let mut field = integer_field("count");
@@ -571,8 +590,7 @@ mod test {
                 );
                 rows.push_back(row);
             }
-            let plan = ProjectionRewritePlan::default();
-            let mut result = Aggregates::new(&rows, &decoder, &aggregate, &plan)
+            let mut result = Aggregates::new(&rows, &decoder, &aggregate, None)
                 .expect("count aggregate")
                 .aggregate()
                 .expect("merge partial counts");
@@ -584,6 +602,77 @@ mod test {
                 expected,
                 "COUNT(*)::{cast}"
             );
+        }
+    }
+
+    #[test]
+    fn aggregate_max_min_compare_money_inet_by_value() {
+        let aggregate = parse("SELECT MAX(price), MIN(price) FROM samples");
+
+        for (oid, shards, max, min) in [
+            (790, ["₹1,000.00", "₹5.00"], "₹1,000.00", "₹5.00"),
+            (869, ["10.0.0.10", "9.0.0.1"], "10.0.0.10", "9.0.0.1"),
+        ] {
+            let mut max_field = integer_field("max");
+            max_field.type_oid = oid;
+            let mut min_field = integer_field("min");
+            min_field.type_oid = oid;
+            let decoder = Decoder::from(RowDescription::new(&[max_field, min_field]));
+
+            let rows = shards
+                .into_iter()
+                .map(|value| DataRow::from_columns(vec![value, value]))
+                .collect::<VecDeque<_>>();
+            let mut result = Aggregates::new(&rows, &decoder, &aggregate, None)
+                .unwrap()
+                .aggregate()
+                .unwrap();
+
+            assert_eq!(result.len(), 1);
+            let row = result.pop_front().unwrap();
+            assert_eq!(row.column(0), Some(Bytes::from(max)), "MAX for oid {oid}");
+            assert_eq!(row.column(1), Some(Bytes::from(min)), "MIN for oid {oid}");
+        }
+    }
+
+    #[test]
+    fn aggregate_group_by_money_inet_merges_equal_values() {
+        let aggregate = parse("SELECT key, COUNT(*) FROM samples GROUP BY 1");
+
+        for (oid, shards, expected) in [
+            (
+                790,
+                [("$5.00", "2"), ("$1,000.00", "1"), ("$5.00", "3")],
+                [("$1,000.00", 1), ("$5.00", 5)],
+            ),
+            (
+                869,
+                [("10.0.0.1", "2"), ("9.0.0.1", "1"), ("10.0.0.1/32", "3")],
+                [("10.0.0.1", 5), ("9.0.0.1", 1)],
+            ),
+        ] {
+            let mut key = integer_field("key");
+            key.type_oid = oid;
+            let decoder = Decoder::from(RowDescription::new(&[key, Field::bigint("count")]));
+
+            let rows = shards
+                .into_iter()
+                .map(|(key, count)| DataRow::from_columns(vec![key, count]))
+                .collect::<VecDeque<_>>();
+            let result = Aggregates::new(&rows, &decoder, &aggregate, None)
+                .unwrap()
+                .aggregate()
+                .unwrap();
+
+            let mut groups = result
+                .iter()
+                .map(|row| (row.column(0).unwrap(), row.get_int(1, true).unwrap()))
+                .collect::<Vec<_>>();
+            groups.sort();
+            let expected = expected
+                .map(|(key, count)| (Bytes::from(key), count))
+                .to_vec();
+            assert_eq!(groups, expected, "GROUP BY oid {oid}");
         }
     }
 
@@ -605,15 +694,10 @@ mod test {
         shard2.add(20.0_f64).add(4_i64);
         rows.push_back(shard2);
 
-        let mut result = Aggregates::new(
-            &rows,
-            &decoder,
-            &aggregate,
-            &ProjectionRewritePlan::default(),
-        )
-        .unwrap()
-        .aggregate()
-        .unwrap();
+        let mut result = Aggregates::new(&rows, &decoder, &aggregate, None)
+            .unwrap()
+            .aggregate()
+            .unwrap();
 
         assert_eq!(result.len(), 2);
         let mut groups: Vec<(f64, i64)> = result
@@ -650,15 +734,10 @@ mod test {
         shard2.add(Bytes::from_static(b"{{5,6},{7,8}}")).add(1_i64);
         rows.push_back(shard2);
 
-        let mut result = Aggregates::new(
-            &rows,
-            &decoder,
-            &aggregate,
-            &ProjectionRewritePlan::default(),
-        )
-        .unwrap()
-        .aggregate()
-        .unwrap();
+        let mut result = Aggregates::new(&rows, &decoder, &aggregate, None)
+            .unwrap()
+            .aggregate()
+            .unwrap();
 
         let mut groups: Vec<(String, i64)> = result
             .drain(..)
@@ -697,15 +776,10 @@ mod test {
         shard1.add(input.clone()).add(1_i64);
         rows.push_back(shard1);
 
-        let mut result = Aggregates::new(
-            &rows,
-            &decoder,
-            &aggregate,
-            &ProjectionRewritePlan::default(),
-        )
-        .unwrap()
-        .aggregate()
-        .unwrap();
+        let mut result = Aggregates::new(&rows, &decoder, &aggregate, None)
+            .unwrap()
+            .aggregate()
+            .unwrap();
 
         assert_eq!(result.len(), 1);
         let row = result.pop_front().unwrap();
@@ -714,6 +788,67 @@ mod test {
 
         assert_eq!(intervals, r#"{"1 year 2 mons 1 day 04:05:06.7"}"#);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn aggregate_group_by_without_aggregate_merges_shard_groups() {
+        let aggregate = parse("SELECT category, region FROM menu GROUP BY 1, 2");
+        let decoder = Decoder::from(RowDescription::new(&[
+            Field::text("category"),
+            Field::text("region"),
+        ]));
+
+        let rows = [
+            ("drinks", "eu"),
+            ("food", "eu"),
+            ("drinks", "eu"),
+            ("drinks", "us"),
+        ]
+        .into_iter()
+        .map(|(category, region)| DataRow::from_columns(vec![category, region]))
+        .collect::<VecDeque<_>>();
+        let result = Aggregates::new(&rows, &decoder, &aggregate, None)
+            .unwrap()
+            .aggregate()
+            .unwrap();
+
+        let mut groups = result
+            .iter()
+            .map(|row| (row.get_text(0).unwrap(), row.get_text(1).unwrap()))
+            .collect::<Vec<_>>();
+        groups.sort();
+        assert_eq!(
+            groups,
+            [("drinks", "eu"), ("drinks", "us"), ("food", "eu")]
+                .map(|(category, region)| (category.to_owned(), region.to_owned()))
+        );
+    }
+
+    #[test]
+    fn aggregate_group_by_undecodable_key_groups_by_bytes() {
+        let aggregate = parse("SELECT created_at FROM events GROUP BY 1");
+        let mut field = integer_field("created_at");
+        field.type_oid = 1184; // timestamptz
+        let decoder = Decoder::from(RowDescription::new(&[field]));
+
+        // timestamptz text with a +05:30 offset doesn't decode yet.
+        let key = "2025-01-15 10:00:15+05:30";
+        assert!(
+            DataRow::from_columns(vec![key])
+                .get_column(0, &decoder)
+                .is_err()
+        );
+
+        let rows = (0..2)
+            .map(|_| DataRow::from_columns(vec![key]))
+            .collect::<VecDeque<_>>();
+        let result = Aggregates::new(&rows, &decoder, &aggregate, None)
+            .unwrap()
+            .aggregate()
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].column(0), Some(Bytes::from(key)));
     }
 
     #[test]

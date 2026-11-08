@@ -1,7 +1,7 @@
 use super::Error;
 use crate::{
     backend::{
-        Cluster, databases,
+        Cluster, databases, passthrough_auth,
         pool::{
             Error as PoolError, Guard, Request,
             connection::mirror::{Mirror, MirrorHandler},
@@ -43,7 +43,9 @@ impl ClusterConnection {
 
     /// Get cluster reference.
     pub(super) fn cluster(&self) -> Result<&Cluster, Error> {
-        self.cluster.as_ref().ok_or(Error::ClusterNotConnected)
+        self.cluster
+            .as_ref()
+            .ok_or_else(|| Error::ClusterNotConnected)
     }
 
     /// Get mirror references.
@@ -138,18 +140,19 @@ impl ClusterConnection {
         shard: usize,
         is_read: bool,
     ) -> Result<Guard, Error> {
-        match self.get_conn_internal(request, shard, is_read).await {
-            Ok(conn) => Ok(conn),
-            Err(Error::Pool(PoolError::Offline | PoolError::AllReplicasDown)) => {
-                debug!(
-                    "detected configuration reload, reloading [{}]",
-                    self.cluster()?.identifier()
-                );
+        loop {
+            match self.get_conn_internal(request, shard, is_read).await {
+                Ok(conn) => return Ok(conn),
+                Err(Error::Pool(PoolError::Offline)) => {
+                    debug!(
+                        "detected configuration reload, reloading [{}]",
+                        self.cluster()?.identifier()
+                    );
 
-                self.safe_reload().await?;
-                self.get_conn_internal(request, shard, is_read).await
+                    self.safe_reload().await?;
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -217,7 +220,11 @@ impl ClusterConnection {
                 }
             }
 
-            databases::add(user)?;
+            // Auth result is ignored because the user
+            // has already authenticated. We could kick them
+            // if the password changed, but that's not how
+            // Postgres does it so we won't either.
+            passthrough_auth::restore_after_reload(user)?;
         }
 
         Ok(())

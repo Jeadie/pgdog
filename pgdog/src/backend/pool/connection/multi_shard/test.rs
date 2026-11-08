@@ -4,10 +4,11 @@ use crate::{
         DistinctBy, OrderBy, Shard, ShardWithPriority,
         rewrite::statement::projection::{OrderByHelper, OrderBySource, ProjectionRewritePlan},
     },
-    net::{BindComplete, DataRow, Field, Format},
+    net::{BindComplete, DataRow, Field, Format, NoData},
 };
 
 use super::*;
+use std::sync::Arc;
 
 fn read_strategy_servers(active: &[bool]) -> Vec<LinkedServer> {
     use crate::backend::{Pool, Server, pool::Guard};
@@ -139,7 +140,7 @@ fn test_order_by_helper_after_star_expansion_is_dropped_after_sorting() {
         Default::default(),
         None,
     );
-    route.projection_rewrite_plan = plan;
+    route.projection_rewrite_plan = Some(Arc::new(plan));
     let mut multi_shard = MultiShard::new(2, &route);
 
     let row_description = RowDescription::new(&[
@@ -308,7 +309,7 @@ fn test_distinct_state_resets_between_requests() {
             .unwrap()
             .unwrap_or_else(|| panic!("request {request} should return CommandComplete"));
         let complete = CommandComplete::from_bytes(message.to_bytes()).unwrap();
-        assert_eq!(complete.rows().unwrap(), Some(1), "request {request}");
+        assert_eq!(complete.rows(), Some(1), "request {request}");
         assert!(multi_shard.get_server_message().unwrap().is_none());
 
         multi_shard.query_complete();
@@ -381,7 +382,7 @@ fn test_omni_command_complete_not_summed() {
     let result = multi_shard.get_server_message().unwrap();
     let cc = CommandComplete::from_bytes(result.unwrap().to_bytes()).unwrap();
     // Should be 5 (from one shard), not 15 (sum of all shards)
-    assert_eq!(cc.rows().unwrap(), Some(5));
+    assert_eq!(cc.rows(), Some(5));
 }
 
 #[test]
@@ -416,7 +417,7 @@ fn test_omni_command_complete_uses_first_shard_row_count() {
     let result = multi_shard.get_server_message().unwrap();
     let cc = CommandComplete::from_bytes(result.unwrap().to_bytes()).unwrap();
     // Should be 7 (from FIRST shard), not 9 (from last)
-    assert_eq!(cc.rows().unwrap(), Some(7));
+    assert_eq!(cc.rows(), Some(7));
 }
 
 #[test]
@@ -532,6 +533,40 @@ fn test_bind_result_formats_apply_per_statement() {
         multi_shard.handle_server_message(0, rd.message()).unwrap();
     }
     assert_eq!(multi_shard.decoder.get_format(0), Format::Text);
+}
+
+/// Rows are decoded with the columns PgDog asked for itself,
+/// and the client only sees the descriptions it asked for.
+#[test]
+fn test_descriptions_pgdog_asked_for_are_not_forwarded() {
+    let mut multi_shard = MultiShard::new(
+        2,
+        &Route::read(ShardWithPriority::new_default_unset(Shard::All)),
+    );
+    multi_shard.set_describes(VecDeque::from([
+        DescribedBy::Client,
+        DescribedBy::PgDog,
+        DescribedBy::PgDog,
+    ]));
+
+    let statement = RowDescription::new(&[Field::text("id")]);
+    let portal = RowDescription::new(&[Field::bigint("id")]);
+    let mut forwarded = vec![];
+
+    for message in [statement.message(), portal.message(), NoData.message()] {
+        for _ in 0..2 {
+            if let Some(message) = multi_shard
+                .handle_server_message(0, message.clone())
+                .unwrap()
+            {
+                forwarded.push(message);
+            }
+        }
+    }
+
+    assert_eq!(forwarded, vec![statement.message()]);
+    assert_eq!(multi_shard.decoder.row_description(), &portal);
+    assert!(multi_shard.describes.is_empty());
 }
 
 /// A Bind that never completed is dropped at ReadyForQuery, so the next
@@ -660,8 +695,7 @@ async fn merge_binding_streams_offset_limit_and_drains_using_specific() {
     assert_eq!(
         CommandComplete::from_bytes(message.to_bytes())
             .unwrap()
-            .rows()
-            .unwrap(),
+            .rows(),
         Some(3)
     );
     assert!(matches!(
@@ -699,8 +733,7 @@ async fn merge_binding_handles_zero_limit_offset_exhaustion_and_unlimited_result
                 'C' => assert_eq!(
                     CommandComplete::from_bytes(message.to_bytes())
                         .unwrap()
-                        .rows()
-                        .unwrap(),
+                        .rows(),
                     Some(expected.len())
                 ),
                 _ => {}
@@ -716,15 +749,14 @@ async fn merge_binding_handles_zero_limit_offset_exhaustion_and_unlimited_result
 #[tokio::test]
 async fn merge_binding_uses_bind_formats_and_drops_helpers_after_ordering() {
     let mut route = merge_route(Some(2), None);
-    route
-        .projection_rewrite_plan
-        .order_by_helpers
-        .push(OrderByHelper {
-            sort_position: 0,
-            source: OrderBySource::Column("id".into()),
-            alias: "id".into(),
-            injected: true,
-        });
+    let mut plan = ProjectionRewritePlan::default();
+    plan.order_by_helpers.push(OrderByHelper {
+        sort_position: 0,
+        source: OrderBySource::Column("id".into()),
+        alias: "id".into(),
+        injected: true,
+    });
+    route.projection_rewrite_plan = Some(Arc::new(plan));
     let rd = RowDescription::new(&[Field::bigint("id"), Field::bigint("value")]);
     let responses = |values: &[(i64, i64)]| {
         let mut messages = vec![BindComplete.message()];

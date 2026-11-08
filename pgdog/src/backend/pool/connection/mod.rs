@@ -318,7 +318,7 @@ impl Connection {
     pub(crate) async fn read(&mut self) -> Result<Message, Error> {
         select! {
             notification = self.pub_sub.recv() => {
-                Ok(notification.ok_or(Error::ProtocolOutOfSync)?.message())
+                Ok(notification.ok_or_else(|| Error::ProtocolOutOfSync)?.message())
             }
 
             // This is cancel-safe.
@@ -455,6 +455,11 @@ impl Connection {
         query: impl Into<Query> + Clone,
     ) -> Result<Vec<Message>, Error> {
         self.binding.execute(query).await
+    }
+
+    /// Record a successfully executed parser-classified statement.
+    pub(crate) fn statement_completed(&mut self, route: &Route) {
+        self.binding.statement_completed(route);
     }
 
     /// We are done and can disconnect from this server.

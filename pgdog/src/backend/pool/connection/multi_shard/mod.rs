@@ -17,6 +17,7 @@ use super::LinkedServer;
 use result_buffer::{MergeState, ResultBuffer};
 
 mod binding;
+mod describe;
 mod error;
 mod result_buffer;
 #[cfg(test)]
@@ -25,6 +26,7 @@ mod upgrade;
 mod validator;
 
 pub(crate) use binding::MultiBinding;
+use describe::DescribedBy;
 pub(crate) use error::Error;
 pub(crate) use upgrade::MultiShardUpgrade;
 use validator::Validator;
@@ -118,6 +120,8 @@ pub(crate) struct MultiShard {
     validator: Validator,
     /// [`Bind`]s waiting for their [`crate::net::BindComplete`], in the order they were sent.
     bound_statements: VecDeque<Bind>,
+    /// Who asked for each description the shards have yet to send, in the order they were sent.
+    describes: VecDeque<DescribedBy>,
 }
 
 impl MultiShard {
@@ -161,6 +165,7 @@ impl MultiShard {
         self.buffer = ResultBuffer::default();
         self.read_strategy = ReadStrategy::default();
         self.validator.reset();
+        self.describes.clear();
 
         // Intentionally does not reset:
         //  1. Route, to keep routing decision
@@ -235,7 +240,7 @@ impl MultiShard {
             'I' => self.handle_empty_query_response(message)?,
             'D' => self.handle_data_row(message, buffer_id)?,
             'G' => Self::handle_passthrough(message, &mut self.request_state.copy_in, self.shards),
-            'n' => Self::handle_passthrough(message, &mut self.request_state.no_data, self.shards),
+            'n' => self.handle_no_data(message),
             '1' => Self::handle_passthrough(
                 message,
                 &mut self.request_state.parse_complete,
@@ -283,7 +288,7 @@ impl MultiShard {
         if let Some(message) = self.request_state.command_complete.take() {
             if let ResultBuffer::Merge(merge) = &self.buffer {
                 let cc = CommandComplete::from_bytes(message.to_bytes())?;
-                return Ok(Some(cc.rewrite(merge.returned)?.message()));
+                return Ok(Some(cc.rewrite(merge.returned).message()));
             }
             return Ok(Some(message));
         }
@@ -299,6 +304,11 @@ impl MultiShard {
     /// protocol requests to make sure we process them in the right order and with correct decoding.
     pub(super) fn push_bind(&mut self, bind: &Bind) {
         self.bound_statements.push_back(bind.clone());
+    }
+
+    /// Who asked for each description in the request we just sent.
+    fn set_describes(&mut self, describes: VecDeque<DescribedBy>) {
+        self.describes = describes;
     }
 
     fn handle_ready_for_query(&mut self, message: Message) -> Result<Option<Message>, Error> {
@@ -347,7 +357,7 @@ impl MultiShard {
         let cc = CommandComplete::from_bytes(message.to_bytes())?;
 
         // DDL commands don't return rows.
-        let has_rows = if let Some(rows) = cc.rows()? {
+        let has_rows = if let Some(rows) = cc.rows() {
             if self.route.is_omnisharded() {
                 // Only use the first shard's row count for consistency with DataRow.
                 if self.request_state.command_complete_count == 0 {
@@ -374,16 +384,15 @@ impl MultiShard {
                 if !buffer.is_empty() {
                     // Helpers remain in the internal row through aggregation and
                     // sorting, then are removed before client-visible operations.
-                    buffer
-                        .aggregate(
-                            self.route.aggregate(),
-                            &self.decoder,
-                            &self.route.projection_rewrite_plan,
-                        )
-                        .map_err(Error::from)?;
+                    let plan = self.route.projection_rewrite_plan.as_deref();
+                    if let Err(err) = buffer.aggregate(self.route.aggregate(), &self.decoder, plan)
+                    {
+                        buffer.clear();
+                        return Err(err.into());
+                    }
 
                     buffer.sort(self.route.order_by(), &self.decoder);
-                    buffer.drop_helper_columns(&self.route.projection_rewrite_plan, &self.decoder);
+                    buffer.drop_helper_columns(plan, &self.decoder);
                     buffer.distinct(self.route.distinct(), &self.decoder);
                     buffer.limit(self.route.limit());
                 }
@@ -399,7 +408,7 @@ impl MultiShard {
                     }
                     _ => self.request_state.rows,
                 };
-                self.request_state.command_complete = Some(cc.rewrite(rows)?.message());
+                self.request_state.command_complete = Some(cc.rewrite(rows).message());
             } else {
                 return Ok(Some(cc.message()));
             }
@@ -443,12 +452,13 @@ impl MultiShard {
         {
             // Only send it to the client once all shards sent it,
             // so we don't get early requests from clients.
-            let plan = &self.route.projection_rewrite_plan;
-            if plan.is_noop() {
-                forward = Some(message);
-            } else {
-                let client_rd = rd.drop_columns(plan.drop_columns(&rd));
-                forward = Some(client_rd.message());
+            if self.client_described() {
+                if let Some(plan) = self.route.projection_rewrite_plan.as_deref() {
+                    let client_rd = rd.drop_columns(plan.drop_columns(&rd));
+                    forward = Some(client_rd.message());
+                } else {
+                    forward = Some(message);
+                }
             }
 
             // The next statement describes a different result set.
@@ -456,6 +466,17 @@ impl MultiShard {
         }
 
         Ok(forward)
+    }
+
+    fn handle_no_data(&mut self, message: Message) -> Option<Message> {
+        let message =
+            Self::handle_passthrough(message, &mut self.request_state.no_data, self.shards)?;
+        self.client_described().then_some(message)
+    }
+
+    /// All shards sent the next description: did the client ask for it?
+    fn client_described(&mut self) -> bool {
+        self.describes.pop_front() != Some(DescribedBy::PgDog)
     }
 
     fn handle_empty_query_response(&mut self, message: Message) -> Result<Option<Message>, Error> {
@@ -486,8 +507,8 @@ impl MultiShard {
 
         if self.shards > 1 {
             // Validate data row consistency.
-            let data_row = DataRow::from_bytes(message.to_bytes())?;
-            self.validator.validate_data_row(&data_row)?;
+            let column_count = DataRow::column_count(message.as_bytes())?;
+            self.validator.validate_column_count(column_count)?;
         }
 
         // INVARIANT: omni dedup relies on Source::Backend carrying a
@@ -558,11 +579,15 @@ impl MultiShard {
     /// Return true if we need to buffer [`DataRow`] messages
     /// received from the servers because we need to post-process them.
     fn should_buffer(&self) -> bool {
+        Self::buffers(self.shards, &self.route)
+    }
+
+    fn buffers(shards: usize, route: &Route) -> bool {
         // 1. We are talking to more than one shard (cross-shard query)
         // 2. The route contains transformations we need to perform, e.g., aggregates, sorting, etc.
         // 3. The route does not concern omnisharded tables which have the same data on all shards
         //    anyway.
-        self.shards > 1 && self.route.requires_post_processing() && !self.route.is_omnisharded()
+        shards > 1 && route.requires_post_processing() && !route.is_omnisharded()
     }
 
     /// Box me up, Scotty.
