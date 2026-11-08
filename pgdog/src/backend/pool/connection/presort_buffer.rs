@@ -83,7 +83,7 @@ impl MergePreSortBuffer {
         let state = self
             .buffers
             .get(buffer_id)
-            .ok_or(Error::InvalidBuffer(buffer_id))?;
+            .ok_or_else(|| Error::InvalidBuffer(buffer_id))?;
         Ok(!state.closed && !self.heap.contains(buffer_id))
     }
 
@@ -92,7 +92,7 @@ impl MergePreSortBuffer {
         let state = self
             .buffers
             .get_mut(buffer_id)
-            .ok_or(Error::InvalidBuffer(buffer_id))?;
+            .ok_or_else(|| Error::InvalidBuffer(buffer_id))?;
 
         if !state.closed {
             if !self.heap.contains(buffer_id) {

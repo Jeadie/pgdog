@@ -57,7 +57,7 @@ impl ResultBuffer {
                     .streams
                     .iter()
                     .position(|stream| stream.shard_id == shard_id)
-                    .ok_or(super::Error::InvalidMergeShard(shard_id))?;
+                    .ok_or_else(|| super::Error::InvalidMergeShard(shard_id))?;
                 match code {
                     'T' => merge.streams[buffer_id].described = true,
                     '2' => merge.streams[buffer_id].bound = true,

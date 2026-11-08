@@ -241,11 +241,11 @@ impl SortColumn {
         };
         let index = position
             .checked_sub(1)
-            .ok_or(Error::ColumnByIndexNotFound(position))?;
+            .ok_or_else(|| Error::ColumnByIndexNotFound(position))?;
         let field = decoder
             .row_description()
             .field(index)
-            .ok_or(Error::ColumnByIndexNotFound(position))?;
+            .ok_or_else(|| Error::ColumnByIndexNotFound(position))?;
         Ok(Self {
             data_type: if matches!(order, OrderByIdx::AscVectorL2(..)) {
                 DataType::Vector
