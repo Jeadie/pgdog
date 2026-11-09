@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare base vs head benchmark runs produced by integration/ci/bench-gh.sh.
 
-Usage: bench-compare.py LABEL=RESULTS_DIR [LABEL=RESULTS_DIR ...]
+Usage: bench-compare.py [--all] LABEL=RESULTS_DIR [LABEL=RESULTS_DIR ...]
 
 Each RESULTS_DIR holds <side>-<round>/<suite>.json files in Bencher Metric
 Format ({"benchmark": {"measure": {"value": N, ...}}}), where side is "base"
@@ -10,9 +10,13 @@ or "head". Prints a Markdown report to stdout.
 For every benchmark/measure the report lists each run, the head-vs-base
 difference of the means, and the A/A spread: the largest max-min range among
 the runs of the same build (base runs against each other, head runs against
-each other). A difference is only flagged when it is larger than that spread;
-otherwise it is reported as within noise. With two runs per side this is a
-coarse filter, not a statistical test.
+each other). A measure is only flagged when the base and head runs do not
+overlap and the gap between them (closest base run to closest head run) is
+larger than that spread; otherwise it is reported as within noise. With two
+runs per side this is a coarse filter, not a statistical test.
+
+Microbenchmark measures are summarized (flagged ones only) unless --all is
+given, which also lists every measure.
 """
 
 import json
@@ -25,6 +29,9 @@ from collections import defaultdict
 # ctx-switches-per-txn, latency, allocations, instructions, ...) is
 # lower-is-better.
 HIGHER_IS_BETTER = {"throughput"}
+
+# Gaps smaller than this fraction of the base mean are float/rounding noise.
+MIN_RELATIVE_GAP = 1e-4
 
 RUN_DIR = re.compile(r"^(base|head)-(\d+)$")
 
@@ -90,7 +97,9 @@ def compare(base, head, measure):
 
     spread = max(max(base) - min(base), max(head) - min(head))
     spread_cell = pct(spread, base_mean).lstrip("+")
-    if abs(delta) <= spread:
+    # Distance between the closest base and head runs; <= 0 when they overlap.
+    gap = min(head) - max(base) if delta > 0 else min(base) - max(head)
+    if gap <= spread or gap <= abs(base_mean) * MIN_RELATIVE_GAP:
         return delta_cell, spread_cell, "within noise", False
 
     better = delta > 0 if measure in HIGHER_IS_BETTER else delta < 0
@@ -106,7 +115,7 @@ def table(rows):
     return "\n".join(lines)
 
 
-def report(label, results_dir):
+def report(label, results_dir, show_all):
     values, missing = load(results_dir)
     out = [f"### {label}", ""]
     if not values:
@@ -137,31 +146,35 @@ def report(label, results_dir):
         out += [f"**Microbenchmarks**: {len(micro_flagged)} of {len(micro)} measures outside the A/A spread", ""]
         if micro_flagged:
             out += [table(micro_flagged), ""]
-        out += [
-            "<details><summary>All microbenchmark measures</summary>",
-            "",
-            table([r for _, r in micro]),
-            "",
-            "</details>",
-            "",
-        ]
+        if show_all:
+            out += [
+                "<details><summary>All microbenchmark measures</summary>",
+                "",
+                table([r for _, r in micro]),
+                "",
+                "</details>",
+                "",
+            ]
     if missing:
         out += ["Failed or missing runs: " + ", ".join(missing), ""]
     return "\n".join(out), flagged
 
 
 def main(argv):
-    if len(argv) < 2:
+    args = argv[1:]
+    show_all = "--all" in args
+    args = [a for a in args if a != "--all"]
+    if not args:
         print(__doc__, file=sys.stderr)
         return 2
     sections = []
     total = 0
-    for arg in argv[1:]:
+    for arg in args:
         label, _, results_dir = arg.partition("=")
         if not results_dir:
             print(f"expected LABEL=DIR, got {arg!r}", file=sys.stderr)
             return 2
-        text, flagged = report(label, results_dir)
+        text, flagged = report(label, results_dir, show_all)
         sections.append(text)
         total += flagged
     print(f"{total} measure(s) differ by more than the A/A spread.\n")

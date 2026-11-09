@@ -30,6 +30,12 @@ cd "${SCRIPT_DIR}/../.."
 export BENCH_GUEST=0
 failed=0
 
+# Every run executes its binaries from the same path, so that the path (argv[0],
+# AT_EXECFN, and with ASLR off the stack layout) is identical for base and head.
+run_bin_dir=${BENCH_RUN_BIN_DIR:-/tmp/pgdog-bench-bin}
+mkdir -p "${run_bin_dir}"
+sha256sum "${base_dir}"/* "${head_dir}"/* | tee "${out_dir}/binaries.sha256"
+
 for suite in "$@"; do
     for round in $(seq 1 "${rounds}"); do
         for side in base head; do
@@ -41,7 +47,8 @@ for suite in "$@"; do
             mkdir -p "${run_dir}"
             echo "::group::${suite} ${side} round ${round}"
             start=$(date +%s)
-            if PGDOG_BIN="${bin_dir}/pgdog" PGDOG_MICROBENCH_BIN="${bin_dir}/pgdog-microbench" \
+            cp -f "${bin_dir}"/* "${run_bin_dir}/"
+            if PGDOG_BIN="${run_bin_dir}/pgdog" PGDOG_MICROBENCH_BIN="${run_bin_dir}/pgdog-microbench" \
                 bash benches/perf/bencher.sh "${suite}" > "${run_dir}/${suite}.json" 2> "${run_dir}/${suite}.log"; then
                 cat "${run_dir}/${suite}.json"
             else

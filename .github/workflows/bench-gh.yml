@@ -261,26 +261,46 @@ jobs:
         run: |
           set -euo pipefail
           args=()
+          identical=()
           for arch in x86_64 arm64; do
-            if [ -d "results/bench-results-$arch" ]; then
-              args+=("$arch (GitHub-hosted, $(awk '/^nproc:/ {print $2}' "results/bench-results-$arch/system.txt") vCPU)=results/bench-results-$arch")
+            dir="results/bench-results-$arch"
+            if [ -d "$dir" ]; then
+              args+=("$arch (GitHub-hosted, $(awk '/^nproc:/ {print $2}' "$dir/system.txt") vCPU)=$dir")
+              # Same hash for base and head of every binary: nothing compiled differs.
+              if [ -f "$dir/binaries.sha256" ] \
+                && [ "$(awk '{print $1}' "$dir/binaries.sha256" | sort | uniq -c | awk '$1 != 2' | wc -l)" -eq 0 ]; then
+                identical+=("$arch")
+              fi
             fi
           done
-          {
+          header() {
             echo "<!-- bench-gh -->"
             echo "## Benchmarks on GitHub-hosted runners"
             echo
-            echo "Base \`${BASE:0:10}\` vs head \`${HEAD:0:10}\`. Suites: \`$SUITES\`, $ROUNDS runs per build interleaved on one runner (base, head, ...), ${WARMUP}s warmup + ${MEASURED}s measured per e2e run. [Run]($RUN_URL) (job result: $BENCH_RESULT; raw output in the \`bench-results-*\` artifacts)."
+            echo "Base \`${BASE:0:10}\` vs head \`${HEAD:0:10}\`. Suites: \`$SUITES\`, $ROUNDS runs per build interleaved on one runner (base, head, ...), ${WARMUP}s warmup + ${MEASURED}s measured per e2e run. [Run]($RUN_URL) (job result: $BENCH_RESULT; raw output in the \`bench-results-*\` artifacts, every microbenchmark measure in the run summary)."
             echo
-            echo "Hosted runners are shared VMs. *A/A spread* is the largest gap between runs of the same build; a difference is only marked better/worse when it exceeds that spread."
+            echo "Hosted runners are shared VMs. *A/A spread* is the largest gap between runs of the same build. A measure is only marked better/worse when base and head runs do not overlap and the gap between them exceeds that spread. With few runs and many measures, expect some false positives."
             echo
+            if [ "${#identical[@]}" -gt 0 ]; then
+              echo "> [!NOTE]"
+              echo "> Base and head binaries are byte-identical on ${identical[*]}, so every difference there is noise."
+              echo
+            fi
+          }
+          compare() {
             if [ "${#args[@]}" -gt 0 ]; then
-              python3 -I integration/ci/bench-compare.py "${args[@]}"
+              python3 -I integration/ci/bench-compare.py "$@" "${args[@]}"
             else
               echo "No results were produced."
             fi
-          } > comment.md
-          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+          }
+          { header; compare; } > comment.md
+          { header; compare --all; } >> "$GITHUB_STEP_SUMMARY"
+          # GitHub rejects comments over 65536 characters.
+          if [ "$(wc -m < comment.md)" -gt 65000 ]; then
+            { head -c 60000 comment.md; echo; echo; echo "_Truncated; see the run summary for the full report._"; } > comment.tmp
+            mv comment.tmp comment.md
+          fi
           cat comment.md
       - name: Post PR comment
         if: github.event_name == 'pull_request'
