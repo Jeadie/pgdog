@@ -130,9 +130,14 @@ jobs:
           key: bench-gh-bin-${{ env.BIN_CACHE_VERSION }}-${{ matrix.arch }}-${{ env.SHA }}
       - name: Install build dependencies
         if: steps.bin.outputs.cache-hit != 'true'
+        # Same packages as release-binaries.yml: cmake + clang for aws-lc-sys, mold
+        # (the linker in .cargo/config.toml), libclang and Postgres build deps
+        # for pg-internals.
         run: |
-          bash integration/ci/install-deps.sh
-          command -v jq > /dev/null || sudo apt-get install -y --no-install-recommends jq
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang pkg-config libssl-dev mold jq \
+            libclang-dev libicu-dev libreadline-dev zlib1g-dev bison flex perl
       - uses: dtolnay/rust-toolchain@stable
         if: steps.bin.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
@@ -196,7 +201,16 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x bins/*/*
-          bash integration/ci/install-deps.sh
+          # PGDG apt repository, as in integration/ci/install-deps.sh.
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL --retry 5 --retry-all-errors \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update
+          # Installs postgresql-18, creates the bench users and databases.
           bash integration/ci/setup.sh
           # bencher.sh starts and stops Postgres around every phase.
           sudo pg_ctlcluster 18 main stop
@@ -234,7 +248,9 @@ jobs:
 
   report:
     needs: [plan, bench]
-    if: always() && needs.plan.result == 'success'
+    # Only when the benchmarks ran, so a failed build does not replace an
+    # earlier comment with an empty one.
+    if: always() && (needs.bench.result == 'success' || needs.bench.result == 'failure')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
