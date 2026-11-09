@@ -35,10 +35,11 @@ env:
 jobs:
   enqueue:
     if: >-
-      github.event_name == 'push'
+      github.repository == 'pgdogdev/pgdog'
+      && (github.event_name == 'push'
       || (github.event_name == 'pull_request'
           && github.event.action != 'labeled'
-          && github.event.pull_request.head.repo.full_name == github.repository)
+          && github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: ubuntu-24.04
     outputs:
       enqueued_at: ${{ steps.enqueue.outputs.enqueued_at }}
@@ -125,7 +126,8 @@ jobs:
 
   enqueue-pgo:
     if: >-
-      github.event_name == 'pull_request'
+      github.repository == 'pgdogdev/pgdog'
+      && github.event_name == 'pull_request'
       && github.event.pull_request.head.repo.full_name == github.repository
       && contains(github.event.pull_request.labels.*.name, 'bench-pgo')
       && (github.event.action != 'labeled' || github.event.label.name == 'bench-pgo')
