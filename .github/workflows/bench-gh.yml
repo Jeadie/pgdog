@@ -1,0 +1,299 @@
+# Runs the benches/perf suites (the same ones the metal workflow runs on bare
+# metal) entirely on GitHub-hosted runners, so they also work on forks that
+# cannot reach the metal infrastructure.
+#
+# Base and head PgDog builds run on the same runner, interleaved per suite
+# (base, head, base, head, ...). Hosted runners are shared VMs, so the spread
+# between repeated runs of the same build (A/A) is reported next to the
+# base-vs-head difference, and a difference is only flagged when it is larger
+# than that spread. Treat the result as a coarse signal, not a verdict.
+#
+# Upstream (pgdogdev/pgdog) has the metal workflow, so pull requests there skip
+# this one; it can still be started manually.
+
+name: bench-gh
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "Suites for benches/perf/bencher.sh (space separated, -wN = N PgDog workers)"
+        default: "pooler lb sharding-w2 microbench"
+      base_ref:
+        description: "Branch, tag or SHA to compare against (its merge-base with the dispatched ref is used)"
+        default: main
+      measured_seconds:
+        description: "Measured pgbench phase per run, seconds (bare metal uses 180)"
+        default: "120"
+      warmup_seconds:
+        description: "Warmup pgbench phase per run, seconds"
+        default: "30"
+      rounds:
+        description: "Runs per build per suite (2+ needed for the A/A spread)"
+        default: "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-gh-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Bencher used the same flag to reduce layout-dependent noise between builds.
+  BENCH_RUSTFLAGS: 'target."cfg(all())".rustflags=["-C","llvm-args=-align-all-functions=6"]'
+  # Bump to invalidate cached binaries when the build recipe changes.
+  BIN_CACHE_VERSION: v1
+
+jobs:
+  plan:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.pull_request.head.repo.full_name == github.repository
+          && github.repository != 'pgdogdev/pgdog')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      base_sha: ${{ steps.plan.outputs.base_sha }}
+      head_sha: ${{ steps.plan.outputs.head_sha }}
+      suites: ${{ steps.plan.outputs.suites }}
+      measured_seconds: ${{ steps.plan.outputs.measured_seconds }}
+      warmup_seconds: ${{ steps.plan.outputs.warmup_seconds }}
+      rounds: ${{ steps.plan.outputs.rounds }}
+    steps:
+      - uses: actions/checkout@v6
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          fetch-depth: 0
+      - name: Resolve commits and settings
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ inputs.base_ref || 'main' }}
+          SUITES: ${{ inputs.suites || 'pooler lb sharding-w2 microbench' }}
+          MEASURED: ${{ inputs.measured_seconds || '120' }}
+          WARMUP: ${{ inputs.warmup_seconds || '30' }}
+          ROUNDS: ${{ inputs.rounds || '2' }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            base=$PR_BASE
+            head=$PR_HEAD
+          else
+            head=$(git rev-parse HEAD)
+            git fetch --no-tags origin "$BASE_REF" 2> /dev/null || true
+            base_commit=$(git rev-parse --verify "origin/$BASE_REF^{commit}" 2> /dev/null \
+              || git rev-parse --verify "$BASE_REF^{commit}")
+            base=$(git merge-base "$base_commit" "$head")
+          fi
+          [[ "$SUITES" =~ ^[a-z0-9\ -]+$ ]] || { echo "invalid suites: $SUITES" >&2; exit 1; }
+          for n in "$MEASURED" "$WARMUP" "$ROUNDS"; do
+            [[ "$n" =~ ^[1-9][0-9]*$ ]] || { echo "not a positive integer: $n" >&2; exit 1; }
+          done
+          {
+            echo "base_sha=$base"
+            echo "head_sha=$head"
+            echo "suites=$SUITES"
+            echo "measured_seconds=$MEASURED"
+            echo "warmup_seconds=$WARMUP"
+            echo "rounds=$ROUNDS"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [x86_64, arm64]
+        side: [base, head]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      SHA: ${{ matrix.side == 'base' && needs.plan.outputs.base_sha || needs.plan.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SHA }}
+      - name: Restore binaries
+        id: bin
+        uses: actions/cache/restore@v5
+        with:
+          path: out
+          key: bench-gh-bin-${{ env.BIN_CACHE_VERSION }}-${{ matrix.arch }}-${{ env.SHA }}
+      - name: Install build dependencies
+        if: steps.bin.outputs.cache-hit != 'true'
+        run: |
+          bash integration/ci/install-deps.sh
+          command -v jq > /dev/null || sudo apt-get install -y --no-install-recommends jq
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.bin.outputs.cache-hit != 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.bin.outputs.cache-hit != 'true'
+        with:
+          prefix-key: bench-gh-v1
+          shared-key: ${{ matrix.arch }}
+      - name: Build pgdog and pgdog-microbench
+        if: steps.bin.outputs.cache-hit != 'true'
+        env:
+          # Keep the embedded commit hash identical between base and head.
+          GIT_HASH: bench
+        run: |
+          set -euo pipefail
+          rustup toolchain install || true
+          mkdir -p out
+          cargo build --release --bin pgdog --config "$BENCH_RUSTFLAGS"
+          cp target/release/pgdog out/pgdog
+          bin=$(cargo test --profile microbench -p pgdog --bin pgdog --features bench --no-run \
+              --message-format=json --config "$BENCH_RUSTFLAGS" \
+            | jq -r 'select(.profile.test == true and .target.name == "pgdog") | .executable')
+          cp "$bin" out/pgdog-microbench
+      - name: Save binaries
+        if: steps.bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: out
+          key: ${{ steps.bin.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}-${{ matrix.side }}
+          path: out
+          retention-days: 1
+
+  bench:
+    needs: [plan, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The harness always comes from head; only the PgDog binaries differ.
+          ref: ${{ needs.plan.outputs.head_sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}-base
+          path: bins/base
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}-head
+          path: bins/head
+      - name: Install PostgreSQL 18 and the bench databases
+        run: |
+          set -euo pipefail
+          chmod +x bins/*/*
+          bash integration/ci/install-deps.sh
+          bash integration/ci/setup.sh
+          # bencher.sh starts and stops Postgres around every phase.
+          sudo pg_ctlcluster 18 main stop
+      - name: Run benchmarks
+        env:
+          SUITES: ${{ needs.plan.outputs.suites }}
+          ROUNDS: ${{ needs.plan.outputs.rounds }}
+          BENCH_MEASURED_SECONDS: ${{ needs.plan.outputs.measured_seconds }}
+          BENCH_WARMUP_SECONDS: ${{ needs.plan.outputs.warmup_seconds }}
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          {
+            echo "runner: ${{ matrix.runner }}"
+            echo "base: ${{ needs.plan.outputs.base_sha }}"
+            echo "head: ${{ needs.plan.outputs.head_sha }}"
+            echo "suites: $SUITES"
+            echo "rounds: $ROUNDS warmup: ${BENCH_WARMUP_SECONDS}s measured: ${BENCH_MEASURED_SECONDS}s"
+            echo "nproc: $(nproc)"
+            lscpu
+          } | tee results/system.txt
+          start=$(date +%s)
+          # word splitting of $SUITES is intended
+          # shellcheck disable=SC2086
+          sudo --preserve-env=BENCH_MEASURED_SECONDS,BENCH_WARMUP_SECONDS env "PATH=$PATH" \
+            bash integration/ci/bench-gh.sh bins/base bins/head results "$ROUNDS" $SUITES
+          echo "bench wall time: $(($(date +%s) - start))s" | tee -a results/system.txt
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ matrix.arch }}
+          path: results
+          retention-days: 30
+
+  report:
+    needs: [plan, bench]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.head_sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-results-*
+          path: results
+      - name: Compare base and head
+        env:
+          BASE: ${{ needs.plan.outputs.base_sha }}
+          HEAD: ${{ needs.plan.outputs.head_sha }}
+          SUITES: ${{ needs.plan.outputs.suites }}
+          ROUNDS: ${{ needs.plan.outputs.rounds }}
+          MEASURED: ${{ needs.plan.outputs.measured_seconds }}
+          WARMUP: ${{ needs.plan.outputs.warmup_seconds }}
+          BENCH_RESULT: ${{ needs.bench.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          args=()
+          for arch in x86_64 arm64; do
+            if [ -d "results/bench-results-$arch" ]; then
+              args+=("$arch (GitHub-hosted, $(awk '/^nproc:/ {print $2}' "results/bench-results-$arch/system.txt") vCPU)=results/bench-results-$arch")
+            fi
+          done
+          {
+            echo "<!-- bench-gh -->"
+            echo "## Benchmarks on GitHub-hosted runners"
+            echo
+            echo "Base \`${BASE:0:10}\` vs head \`${HEAD:0:10}\`. Suites: \`$SUITES\`, $ROUNDS runs per build interleaved on one runner (base, head, ...), ${WARMUP}s warmup + ${MEASURED}s measured per e2e run. [Run]($RUN_URL) (job result: $BENCH_RESULT; raw output in the \`bench-results-*\` artifacts)."
+            echo
+            echo "Hosted runners are shared VMs. *A/A spread* is the largest gap between runs of the same build; a difference is only marked better/worse when it exceeds that spread."
+            echo
+            if [ "${#args[@]}" -gt 0 ]; then
+              python3 -I integration/ci/bench-compare.py "${args[@]}"
+            else
+              echo "No results were produced."
+            fi
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+          cat comment.md
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          marker="<!-- bench-gh -->"
+          existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" \
+            --jq "map(select(.body | startswith(\"$marker\")))[0].id // empty" | head -n 1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F body=@comment.md > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@comment.md > /dev/null
+          fi

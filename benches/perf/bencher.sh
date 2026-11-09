@@ -99,11 +99,11 @@ for name in "$@"; do
     fi
 
     for phase in warmup measured; do
-        seconds=180
+        seconds=${BENCH_MEASURED_SECONDS:-180}
         perf_out=""
         perf_stat_out=""
         if [ "${phase}" = warmup ]; then
-            seconds=30
+            seconds=${BENCH_WARMUP_SECONDS:-30}
             if [ -n "${BENCH_PERF_DIR:-}" ]; then
                 perf_out="${BENCH_PERF_DIR}/${name}.perf.data"
             fi
