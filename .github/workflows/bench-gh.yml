@@ -31,7 +31,7 @@ on:
         default: "30"
       rounds:
         description: "Runs per build per suite (2+ needed for the A/A spread)"
-        default: "2"
+        default: "3"
 
 permissions:
   contents: read
@@ -76,7 +76,7 @@ jobs:
           SUITES: ${{ inputs.suites || 'pooler lb sharding-w2 microbench' }}
           MEASURED: ${{ inputs.measured_seconds || '120' }}
           WARMUP: ${{ inputs.warmup_seconds || '30' }}
-          ROUNDS: ${{ inputs.rounds || '2' }}
+          ROUNDS: ${{ inputs.rounds || '3' }}
         run: |
           set -euo pipefail
           if [ "$EVENT" = pull_request ]; then
