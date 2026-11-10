@@ -170,22 +170,23 @@ impl MultiBinding {
     pub(crate) async fn read(&mut self) -> Result<Option<Message>, Error> {
         loop {
             // Return all sorted data rows if any.
-            if let Some(message) = self.state.get_server_message() {
+            if let Some(message) = self.state.get_server_message()? {
                 return Ok(Some(message));
             }
 
             let mut read = false;
             let mut multi_shard_err = None;
 
-            for server in &mut self.servers {
-                if !server.has_more_messages() {
-                    continue;
-                }
-
-                let message = server.read().await?;
+            self.state.prepare_read(&self.servers)?;
+            self.state.read_strategy_mut().reset();
+            while let Some(index) = self.state.read_strategy_mut().next_server(&self.servers) {
+                let message = self.servers[index].read().await?;
                 read = true;
 
-                match self.state.handle_server_message(message) {
+                match self
+                    .state
+                    .handle_server_message(self.servers[index].shard, message)
+                {
                     Ok(message) => {
                         if let Some(message) = message {
                             return Ok(Some(message));
@@ -265,9 +266,24 @@ impl MultiBinding {
         if client_request.is_sync_only() {
             self.state.update_shards(shards_sent);
         } else {
+            // Check the request the shards actually received, including any
+            // Describe messages added above.
+            let merge = super::result_buffer::can_merge(request);
             self.state.update(shards_sent, route);
             if let Some((_, describes)) = described {
                 self.state.set_describes(describes);
+            }
+            if merge {
+                self.state.start_merge(
+                    self.servers
+                        .iter()
+                        .filter(|server| match route.shard() {
+                            Shard::All => true,
+                            Shard::Multi(shards) => shards.contains(&server.shard),
+                            Shard::Direct(shard) => server.shard == *shard,
+                        })
+                        .map(|server| server.shard),
+                );
             }
         }
 

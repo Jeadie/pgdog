@@ -38,6 +38,12 @@ pub(crate) enum Error {
 
     #[error("unexpected multi-shard error: {0}")]
     Unexpected(String),
+
+    #[error("{0}")]
+    Buffer(#[from] super::super::buffer::Error),
+
+    #[error("shard {0} has no merge stream")]
+    InvalidMergeShard(usize),
 }
 
 impl Error {

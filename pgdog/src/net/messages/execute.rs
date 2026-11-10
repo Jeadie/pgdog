@@ -73,6 +73,17 @@ impl Execute {
         from_utf8(buf).unwrap_or("")
     }
 
+    /// Maximum rows requested by Execute; zero runs the portal to completion.
+    pub(crate) fn max_rows(&self) -> i32 {
+        let start = self.payload.len() - 4;
+        i32::from_be_bytes([
+            self.payload[start],
+            self.payload[start + 1],
+            self.payload[start + 2],
+            self.payload[start + 3],
+        ])
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.payload.len()
     }

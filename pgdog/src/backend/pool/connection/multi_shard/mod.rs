@@ -13,11 +13,13 @@ use crate::{
     },
 };
 
-use super::buffer::Buffer;
+use super::{LinkedServer, buffer::sort_types_match};
+use result_buffer::{MergeState, ResultBuffer};
 
 mod binding;
 mod describe;
 mod error;
+mod result_buffer;
 #[cfg(test)]
 mod test;
 mod upgrade;
@@ -27,7 +29,78 @@ pub(crate) use binding::MultiBinding;
 use describe::DescribedBy;
 pub(crate) use error::Error;
 pub(crate) use upgrade::MultiShardUpgrade;
+
+/// Test-only access for checking which result buffer a routed request uses.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) use super::result_buffer::{can_merge, supported_order};
+    pub(crate) use super::test::simulated_merge_binding;
+
+    impl super::MultiBinding {
+        /// "Merge" or "Full": the result buffer variant currently active.
+        pub(crate) fn result_buffer_kind(&self) -> &'static str {
+            match self.state.buffer {
+                super::ResultBuffer::Full(_) => "Full",
+                super::ResultBuffer::Merge(_) => "Merge",
+            }
+        }
+
+        /// CommandComplete messages received from shards so far.
+        pub(crate) fn command_complete_count(&self) -> usize {
+            self.state.request_state.command_complete_count
+        }
+    }
+}
 use validator::Validator;
+
+/// Determine which [`LinkedServer`] to pull server messages from next.
+#[derive(Debug)]
+pub(super) enum ReadStrategy {
+    /// Read one message per active server in each ordered pass.
+    /// Each call starts at the first server, including after an early return.
+    RoundRobin { next: usize },
+    /// Read one message from the requested shard's server per pass.
+    Specific { shard_id: usize, consumed: bool },
+}
+
+impl Default for ReadStrategy {
+    fn default() -> Self {
+        Self::RoundRobin { next: 0 }
+    }
+}
+
+impl ReadStrategy {
+    /// Start a fresh pass through the servers.
+    fn reset(&mut self) {
+        match self {
+            Self::RoundRobin { next } => *next = 0,
+            Self::Specific { consumed, .. } => *consumed = false,
+        }
+    }
+
+    /// Select the next active server and advance the strategy's cursor.
+    fn next_server(&mut self, servers: &[LinkedServer]) -> Option<usize> {
+        match self {
+            Self::RoundRobin { next } => {
+                let index = servers
+                    .iter()
+                    .enumerate()
+                    .skip(*next)
+                    .find_map(|(index, server)| server.has_more_messages().then_some(index));
+                *next = index.map_or(servers.len(), |index| index + 1);
+                index
+            }
+            Self::Specific { shard_id, consumed } => {
+                if std::mem::replace(consumed, true) {
+                    return None;
+                }
+                servers
+                    .iter()
+                    .position(|server| server.shard == *shard_id && server.has_more_messages())
+            }
+        }
+    }
+}
 
 #[derive(Default, Debug)]
 struct RequestState {
@@ -60,7 +133,9 @@ pub(crate) struct MultiShard {
     /// In-flight request state.
     request_state: RequestState,
     /// Sorting/aggregate buffer.
-    buffer: Buffer,
+    buffer: ResultBuffer,
+    /// Server read policy for the current query.
+    read_strategy: ReadStrategy,
     /// Row decoder.
     decoder: Decoder,
     /// Row consistency validator.
@@ -109,7 +184,8 @@ impl MultiShard {
 
     fn reset(&mut self) {
         self.request_state = RequestState::default();
-        self.buffer = Buffer::default();
+        self.buffer = ResultBuffer::default();
+        self.read_strategy = ReadStrategy::default();
         self.validator.reset();
         self.describes.clear();
 
@@ -118,6 +194,45 @@ impl MultiShard {
         //  2. Number of shards
         //  3. Decoder state
         //  4. Pending Binds, pushed before this run
+    }
+
+    pub(super) fn read_strategy_mut(&mut self) -> &mut ReadStrategy {
+        &mut self.read_strategy
+    }
+
+    /// Request one message per pass from a particular shard's server.
+    pub(super) fn read_from(&mut self, shard_id: usize) {
+        self.read_strategy = ReadStrategy::Specific {
+            shard_id,
+            consumed: false,
+        };
+    }
+
+    /// Choose a merge buffer once the binding knows the participating shard IDs.
+    pub(super) fn start_merge(&mut self, shard_ids: impl Iterator<Item = usize>) {
+        if self.should_buffer() {
+            self.buffer = ResultBuffer::Merge(MergeState::new(shard_ids));
+        }
+    }
+
+    /// Merge reads request a missing candidate; cleanup reads still use Specific.
+    pub(super) fn prepare_read(&mut self, servers: &[LinkedServer]) -> Result<(), Error> {
+        if let ResultBuffer::Merge(merge) = &self.buffer {
+            let descriptions_pending = self.request_state.row_description > 0
+                && !self
+                    .request_state
+                    .row_description
+                    .is_multiple_of(self.shards);
+            let shard_id = merge.next_shard(
+                servers,
+                !self.bound_statements.is_empty(),
+                descriptions_pending,
+            )?;
+            if let Some(shard_id) = shard_id {
+                self.read_from(shard_id);
+            }
+        }
+        Ok(())
     }
 
     /// Check if the message we received from Postgres should be sent to the client, skipped,
@@ -133,14 +248,19 @@ impl MultiShard {
     ///
     pub(super) fn handle_server_message(
         &mut self,
+        shard_id: usize,
         message: Message,
     ) -> Result<Option<Message>, Error> {
+        let buffer_id = self
+            .buffer
+            .observe_server_message(shard_id, message.code())?;
+
         Ok(match message.code() {
             'Z' => self.handle_ready_for_query(message)?,
-            'C' => self.handle_command_complete(message)?,
+            'C' => self.handle_command_complete(message, buffer_id)?,
             'T' => self.handle_row_description(message)?,
             'I' => self.handle_empty_query_response(message)?,
-            'D' => self.handle_data_row(message)?,
+            'D' => self.handle_data_row(message, buffer_id)?,
             'G' => Self::handle_passthrough(message, &mut self.request_state.copy_in, self.shards),
             'n' => self.handle_no_data(message),
             '1' => Self::handle_passthrough(
@@ -173,11 +293,28 @@ impl MultiShard {
     /// Used when buffering and transforming messages. This returns [`None`] until
     /// the state is ready, i.e., we received everything we need to sort/limit/offset, etc.
     ///
-    pub(super) fn get_server_message(&mut self) -> Option<Message> {
-        match self.buffer.take() {
-            Some(data_row) => Some(data_row),
-            _ => self.request_state.command_complete.take(),
+    pub(super) fn get_server_message(&mut self) -> Result<Option<Message>, Error> {
+        // Do not expose rows before all shard descriptions have been validated.
+        if self.request_state.row_description > 0
+            && !self
+                .request_state
+                .row_description
+                .is_multiple_of(self.shards)
+        {
+            return Ok(None);
         }
+        let row = self.buffer.take(&self.route);
+        if row.is_some() {
+            return Ok(row);
+        }
+        if let Some(message) = self.request_state.command_complete.take() {
+            if let ResultBuffer::Merge(merge) = &self.buffer {
+                let cc = CommandComplete::from_bytes(message.to_bytes())?;
+                return Ok(Some(cc.rewrite(merge.returned).message()));
+            }
+            return Ok(Some(message));
+        }
+        Ok(None)
     }
 
     /// The state has more messages for the client.
@@ -226,7 +363,19 @@ impl MultiShard {
     //
     // Once all shards finished executing the command,
     // we can start aggregating and sorting.
-    fn handle_command_complete(&mut self, message: Message) -> Result<Option<Message>, Error> {
+    fn handle_command_complete(
+        &mut self,
+        message: Message,
+        buffer_id: Option<usize>,
+    ) -> Result<Option<Message>, Error> {
+        if !self.buffer.ensure_initialized(&self.route, &self.decoder)? {
+            self.read_strategy = ReadStrategy::default();
+        }
+        if let (ResultBuffer::Merge(merge), Some(buffer_id)) = (&mut self.buffer, buffer_id)
+            && let Some(buffer) = &mut merge.buffer
+        {
+            buffer.mark_complete(buffer_id)?;
+        }
         let cc = CommandComplete::from_bytes(message.to_bytes())?;
 
         // DDL commands don't return rows.
@@ -251,31 +400,35 @@ impl MultiShard {
             .command_complete_count
             .is_multiple_of(self.shards)
         {
-            self.buffer.mark_full();
+            if let ResultBuffer::Full(buffer) = &mut self.buffer {
+                buffer.mark_full();
 
-            if !self.buffer.is_empty() {
-                // Helpers remain in the internal row through aggregation and
-                // sorting, then are removed before client-visible operations.
-                let plan = self.route.projection_rewrite_plan.as_deref();
-                if let Err(err) = self
-                    .buffer
-                    .aggregate(self.route.aggregate(), &self.decoder, plan)
-                {
-                    self.buffer.clear();
-                    return Err(err.into());
+                if !buffer.is_empty() {
+                    // Helpers remain in the internal row through aggregation and
+                    // sorting, then are removed before client-visible operations.
+                    let plan = self.route.projection_rewrite_plan.as_deref();
+                    if let Err(err) = buffer.aggregate(self.route.aggregate(), &self.decoder, plan)
+                    {
+                        buffer.clear();
+                        return Err(err.into());
+                    }
+
+                    buffer.sort(self.route.order_by(), &self.decoder);
+                    buffer.drop_helper_columns(plan, &self.decoder);
+                    buffer.distinct(self.route.distinct(), &self.decoder);
+                    buffer.limit(self.route.limit());
                 }
-
-                self.buffer.sort(self.route.order_by(), &self.decoder);
-                self.buffer.drop_helper_columns(plan, &self.decoder);
-                self.buffer.distinct(self.route.distinct(), &self.decoder);
-                self.buffer.limit(self.route.limit());
             }
 
             if has_rows {
-                let rows = if self.should_buffer() {
-                    self.buffer.len()
-                } else {
-                    self.request_state.rows
+                let rows = match &self.buffer {
+                    ResultBuffer::Full(buffer) if self.should_buffer() => buffer.len(),
+                    ResultBuffer::Merge(_) => {
+                        // The merge may still contain rows. Rewrite the count when consumed.
+                        self.request_state.command_complete = Some(cc.message());
+                        return Ok(None);
+                    }
+                    _ => self.request_state.rows,
                 };
                 self.request_state.command_complete = Some(cc.rewrite(rows).message());
             } else {
@@ -300,6 +453,13 @@ impl MultiShard {
         // can use it.
         if is_first_in_group {
             self.decoder.set_row_description(rd.clone());
+        } else if matches!(self.buffer, ResultBuffer::Merge(_))
+            && !sort_types_match(self.route.order_by(), &self.decoder, &rd)
+        {
+            // The legacy validator permits differing types. The merge compares
+            // only sort keys; if theirs differ, preserve the buffered behavior.
+            self.buffer = ResultBuffer::default();
+            self.read_strategy = ReadStrategy::default();
         }
 
         if self
@@ -352,7 +512,14 @@ impl MultiShard {
         )
     }
 
-    fn handle_data_row(&mut self, message: Message) -> Result<Option<Message>, Error> {
+    fn handle_data_row(
+        &mut self,
+        message: Message,
+        buffer_id: Option<usize>,
+    ) -> Result<Option<Message>, Error> {
+        if !self.buffer.ensure_initialized(&self.route, &self.decoder)? {
+            self.read_strategy = ReadStrategy::default();
+        }
         let mut forward = None;
 
         if self.shards > 1 {
@@ -382,7 +549,15 @@ impl MultiShard {
                 forward = Some(message);
             }
         } else {
-            self.buffer.add(message).map_err(Error::from)?;
+            match &mut self.buffer {
+                ResultBuffer::Full(buffer) => buffer.add(message).map_err(Error::from)?,
+                ResultBuffer::Merge(merge) if !merge.draining => {
+                    if let (Some(buffer), Some(buffer_id)) = (&mut merge.buffer, buffer_id) {
+                        buffer.add(buffer_id, message)?;
+                    }
+                }
+                ResultBuffer::Merge(_) => {}
+            }
         }
 
         Ok(forward)
