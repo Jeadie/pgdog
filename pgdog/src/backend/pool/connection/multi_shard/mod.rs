@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-use super::LinkedServer;
+use super::{LinkedServer, buffer::sort_types_match};
 use result_buffer::{MergeState, ResultBuffer};
 
 mod binding;
@@ -29,6 +29,28 @@ pub(crate) use binding::MultiBinding;
 use describe::DescribedBy;
 pub(crate) use error::Error;
 pub(crate) use upgrade::MultiShardUpgrade;
+
+/// Test-only access for checking which result buffer a routed request uses.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) use super::result_buffer::{can_merge, supported_order};
+    pub(crate) use super::test::simulated_merge_binding;
+
+    impl super::MultiBinding {
+        /// "Merge" or "Full": the result buffer variant currently active.
+        pub(crate) fn result_buffer_kind(&self) -> &'static str {
+            match self.state.buffer {
+                super::ResultBuffer::Full(_) => "Full",
+                super::ResultBuffer::Merge(_) => "Merge",
+            }
+        }
+
+        /// CommandComplete messages received from shards so far.
+        pub(crate) fn command_complete_count(&self) -> usize {
+            self.state.request_state.command_complete_count
+        }
+    }
+}
 use validator::Validator;
 
 /// Determine which [`LinkedServer`] to pull server messages from next.
@@ -432,15 +454,10 @@ impl MultiShard {
         if is_first_in_group {
             self.decoder.set_row_description(rd.clone());
         } else if matches!(self.buffer, ResultBuffer::Merge(_))
-            && self
-                .decoder
-                .row_description()
-                .fields
-                .iter()
-                .zip(rd.fields.iter())
-                .any(|(left, right)| left.data_type() != right.data_type())
+            && !sort_types_match(self.route.order_by(), &self.decoder, &rd)
         {
-            // The legacy validator permits differing types. Preserve its buffered behavior.
+            // The legacy validator permits differing types. The merge compares
+            // only sort keys; if theirs differ, preserve the buffered behavior.
             self.buffer = ResultBuffer::default();
             self.read_strategy = ReadStrategy::default();
         }

@@ -221,7 +221,7 @@ impl MergeState {
 ///
 /// These checks cover SQL ordering and protocol lifecycle. Column resolution and
 /// comparison compatibility are checked by `supported_order` once result metadata arrives.
-pub(super) fn can_merge(request: &ClientRequest) -> bool {
+pub(crate) fn can_merge(request: &ClientRequest) -> bool {
     let route = request.route();
     // The heap needs sort keys. Aggregation and DISTINCT need global processing
     // before LIMIT can be applied, so they retain the full-buffer path.
@@ -297,7 +297,7 @@ pub(super) fn can_merge(request: &ClientRequest) -> bool {
         })
 }
 
-pub(super) fn supported_order(route: &Route, decoder: &Decoder) -> bool {
+pub(crate) fn supported_order(route: &Route, decoder: &Decoder) -> bool {
     if !decoder.has_row_description() {
         return false;
     }

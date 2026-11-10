@@ -598,7 +598,10 @@ fn test_ready_for_query_drops_pending_binds() {
 }
 
 /// Exercise the actual read loop without a database or network connection.
-fn simulated_merge_binding(route: &Route, responses: Vec<(usize, Vec<Message>)>) -> MultiBinding {
+pub(crate) fn simulated_merge_binding(
+    route: &Route,
+    responses: Vec<(usize, Vec<Message>)>,
+) -> MultiBinding {
     use crate::backend::{Pool, Server, pool::Guard};
     use tokio::time::Instant;
     let servers: Vec<_> = responses

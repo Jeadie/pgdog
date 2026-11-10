@@ -223,6 +223,28 @@ fn to_index_order_by(column: &OrderBy, decoder: &Decoder) -> Result<OrderByIdx> 
     }
 }
 
+/// Whether every sort key decodes as the same type in both result descriptions.
+/// Other columns are forwarded as bytes, so their type OIDs may differ, e.g.
+/// extension types such as pgvector get a per-database OID.
+pub(super) fn sort_types_match(
+    columns: &[OrderBy],
+    first: &Decoder,
+    other: &crate::net::RowDescription,
+) -> bool {
+    columns.iter().all(|column| {
+        to_index_order_by(column, first).is_ok_and(|order| {
+            let (OrderByIdx::Asc(position) | OrderByIdx::Desc(position)) = order else {
+                // Vector distance sorts decode as Vector regardless of the column OID.
+                return true;
+            };
+            position
+                .checked_sub(1)
+                .and_then(|index| first.row_description().field(index).zip(other.field(index)))
+                .is_some_and(|(left, right)| left.data_type() == right.data_type())
+        })
+    })
+}
+
 /// Only the sort columns' types and formats are needed after resolving names.
 #[derive(Debug)]
 pub(super) struct SortColumn {
