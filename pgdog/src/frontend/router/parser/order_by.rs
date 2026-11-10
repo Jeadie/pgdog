@@ -69,14 +69,6 @@ impl OrderBy {
         )
     }
 
-    /// Column index.
-    pub(crate) fn index(&self) -> Option<usize> {
-        match self {
-            OrderBy::Index(order_by) => Some(order_by.index()),
-            OrderBy::Column(_) => None,
-        }
-    }
-
     /// ORDER BY clause contains a vector.
     pub(crate) fn vector(&self) -> Option<(&Vector, &String)> {
         match self {

@@ -1,4 +1,3 @@
-use crate::frontend::router::parser::order_by::OrderByIdx;
 use std::{fmt::Display, ops::Deref, sync::Arc};
 
 use super::{
@@ -708,6 +707,7 @@ impl ShardsWithPriority {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::frontend::router::parser::order_by::OrderByIdx;
 
     #[test]
     fn test_shard_ord() {

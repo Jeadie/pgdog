@@ -6,7 +6,7 @@ use crate::{
     frontend::router::parser::OrderBy,
     net::{
         Decoder,
-        messages::{DataRow, FromBytes, Message, Protocol, ToBytes},
+        messages::{DataRow, FromBytes, Message, ToBytes},
     },
 };
 
@@ -216,7 +216,10 @@ mod test {
     use super::*;
     use crate::{
         frontend::router::parser::order_by::{OrderByColumn, OrderByIdx},
-        net::{Field, Format, RowDescription, messages::Vector},
+        net::{
+            Field, Format, RowDescription,
+            messages::{Protocol, Vector},
+        },
     };
     use bytes::Bytes;
 
